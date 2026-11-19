@@ -8,10 +8,18 @@
 - [x] Markdown entry creation and retrieval
 - [ ] Broader TOML parser and human-friendly update/revision workflow
 
-## Phase 2 — CLI (in progress)
+## Phase 2 — CLI (complete)
 
 - [x] Clap CLI for initialization, notes, sessions, decisions, tasks, and status
-- [ ] JSON output and direct task status/revision browsing
+- [x] JSON output for status, search, context, lists, entry display, and recovery
+- [x] Terminal-aware prompts with cancellation and non-interactive failure behavior
+- [ ] Task revision history grouping in list output
+
+## Storage reliability milestone (complete)
+
+- [x] Same-directory staging, sync, read-back validation, and no-replace publication
+- [x] Stale temp discovery and explicit cleanup without promotion
+- [x] Duplicate and concurrent create protection
 
 ## Phase 3 — Indexing and search
 

@@ -6,7 +6,7 @@ The workspace has one editor-independent crate, `devjournal-core`. It owns the e
 
 Each entry records category, author type/name, source, timestamps, tags, relationships, and optional status. An AI author remains explicitly marked `ai`; writing an entry does not promote it into verified human knowledge. Humans can review and edit the Markdown directly.
 
-Writes create the final path exclusively and flush it, preventing simultaneous writers from silently replacing an existing record. Existing records are create-only in Phase 1. A process interruption during a write can leave a partial file; full atomic replacement remains an open implementation detail.
+Entry writes stage a unique file in the destination directory, flush and sync it, parse it back and compare it with the requested entry, then publish it with a no-replace operation. Windows uses same-volume `MoveFileW`; Unix uses hard-link publication, then removes the temporary name and syncs the parent directory. Concurrent duplicate IDs cannot overwrite one another. Failed writes clean up their temp; interruption can leave a named temp for explicit `recover` inspection or cleanup.
 
 ## Planned boundaries
 

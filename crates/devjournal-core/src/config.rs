@@ -1,8 +1,9 @@
+use serde::Serialize;
 use std::{fs, path::Path};
 
 use crate::{Error, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProjectConfig {
     pub name: String,
     pub description: String,

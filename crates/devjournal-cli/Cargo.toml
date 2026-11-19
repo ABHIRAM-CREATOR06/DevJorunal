@@ -12,3 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 devjournal-core = { path = "../devjournal-core" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

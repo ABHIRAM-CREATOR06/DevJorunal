@@ -1,9 +1,15 @@
-use std::{path::PathBuf, process::ExitCode};
-
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use devjournal_core::{
-    Author, AuthorType, Category, Entry, EntrySource, EntrySourceType, Journal, JournalConfig,
+use std::{
+    io::{self, BufRead, IsTerminal, Write},
+    path::PathBuf,
+    process::ExitCode,
 };
+
+use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use devjournal_core::{
+    Author, AuthorType, Category, Entry, EntrySource, EntrySourceType, Error, Journal,
+    JournalConfig,
+};
+use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(
@@ -14,6 +20,8 @@ use devjournal_core::{
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
     project: PathBuf,
+    #[arg(long, global = true, help = "Emit machine-readable JSON")]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -29,11 +37,11 @@ enum Command {
     Status,
     Note {
         #[command(subcommand)]
-        command: NewCommand,
+        command: Option<NewCommand>,
     },
     Decision {
         #[command(subcommand)]
-        command: NewCommand,
+        command: Option<NewCommand>,
     },
     Session {
         #[command(subcommand)]
@@ -49,22 +57,35 @@ enum Command {
         category: Option<CategoryArg>,
     },
     Context {
-        topic: String,
+        topic: Option<String>,
     },
-    Show {
+    Entry {
+        #[command(subcommand)]
+        command: EntryCommand,
+    },
+    #[command(alias = "show")]
+    LegacyShow {
         id: String,
+    },
+    Recover {
+        #[arg(long, help = "Delete only recognized stale DevJournal temporary files")]
+        clean: bool,
     },
 }
 
+#[derive(Subcommand)]
+enum EntryCommand {
+    Show { id: String },
+}
 #[derive(Subcommand)]
 enum NewCommand {
     New(NewArgs),
 }
 #[derive(Args)]
 struct NewArgs {
-    title: String,
+    title: Option<String>,
     #[arg(long)]
-    content: String,
+    content: Option<String>,
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
     #[arg(long, default_value = "human")]
@@ -73,7 +94,7 @@ struct NewArgs {
 #[derive(Subcommand)]
 enum SessionCommand {
     Start {
-        title: String,
+        title: Option<String>,
         #[arg(long, default_value = "human")]
         author: String,
     },
@@ -84,7 +105,7 @@ enum TaskCommand {
     List,
     Update {
         id: String,
-        status: String,
+        status: Option<String>,
         #[arg(long, default_value = "human")]
         author: String,
     },
@@ -124,20 +145,50 @@ impl From<CategoryArg> for Category {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let json_requested = std::env::args_os().any(|arg| arg == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                let _ = error.print();
+                return ExitCode::SUCCESS;
+            }
+            if json_requested {
+                emit_error("INVALID_ARGUMENTS", &error.to_string());
+            } else {
+                let _ = error.print();
+            }
+            return ExitCode::from(2);
+        }
+    };
+    let json = cli.json;
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("devjournal: {error}");
-            ExitCode::FAILURE
+            if json {
+                let (code, message) = error_details(error.as_ref());
+                emit_error(code, &message);
+            } else {
+                eprintln!("devjournal: {error}");
+            }
+            ExitCode::from(1)
         }
     }
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match cli.command {
+    let Cli {
+        project,
+        json: as_json,
+        command,
+    } = cli;
+    match command {
         Command::Init { name, description } => {
             let name = name.unwrap_or_else(|| {
-                cli.project
+                project
                     .file_name()
                     .and_then(|v| v.to_str())
                     .unwrap_or("project")
@@ -145,33 +196,42 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             });
             let mut config = JournalConfig::defaults(name);
             config.project.description = description;
-            let journal = Journal::init(&cli.project, config)?;
-            println!("Initialized {}", journal.root().display());
+            let journal = Journal::init(&project, config)?;
+            emit(
+                as_json,
+                json!({"journal": journal.root()}),
+                format!("Initialized {}", journal.root().display()),
+            );
         }
         Command::Status => {
-            let journal = Journal::open(&cli.project)?;
+            let journal = Journal::open(&project)?;
             let config = journal.config()?;
-            println!(
-                "{} — {}",
-                config.project.name,
-                if config.local_only {
-                    "local-only"
-                } else {
-                    "sync policy not configured"
-                }
+            let count = journal.entries()?.len();
+            emit(
+                as_json,
+                json!({"project": config.project, "local_only": config.local_only, "entry_count": count}),
+                format!(
+                    "{} — {}\n{count} entries",
+                    config.project.name,
+                    if config.local_only {
+                        "local-only"
+                    } else {
+                        "sync policy not configured"
+                    }
+                ),
             );
-            println!("{} entries", journal.entries()?.len());
         }
-        Command::Note {
-            command: NewCommand::New(args),
-        } => create(&cli.project, Category::Note, args)?,
-        Command::Decision {
-            command: NewCommand::New(args),
-        } => create(&cli.project, Category::Decision, args)?,
+        Command::Note { command } => {
+            create_interactive(&project, Category::Note, command, as_json)?
+        }
+        Command::Decision { command } => {
+            create_interactive(&project, Category::Decision, command, as_json)?
+        }
         Command::Session {
             command: SessionCommand::Start { title, author },
         } => {
-            let journal = Journal::open(&cli.project)?;
+            let title = required_single(title, "Session title", as_json)?;
+            let journal = Journal::open(&project)?;
             let mut entry = Entry::new(
                 title,
                 Category::Session,
@@ -179,21 +239,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 author_record(&author),
             );
             entry.source = source_for(&author);
-            println!("{}", journal.create_entry(&entry)?.display());
+            let path = journal.create_entry(&entry)?;
+            emit(
+                as_json,
+                json!({"path": path, "entry": entry}),
+                path.display().to_string(),
+            );
         }
         Command::Session {
             command: SessionCommand::List,
-        } => list(&cli.project, Category::Session)?,
+        } => list(&project, Category::Session, as_json)?,
         Command::Task {
             command: TaskCommand::List,
-        } => list(&cli.project, Category::Task)?,
+        } => list(&project, Category::Task, as_json)?,
         Command::Task {
             command: TaskCommand::Update { id, status, author },
         } => {
-            let journal = Journal::open(&cli.project)?;
+            let status = required_single(status, "Task status", as_json)?;
+            let journal = Journal::open(&project)?;
             let old = journal.get_entry(&id)?;
             if old.category != Category::Task {
-                return Err(format!("{id} is not a task").into());
+                return Err(Box::new(Error::Invalid(format!("{id} is not a task"))));
             }
             let mut update = Entry::new(
                 old.title,
@@ -204,59 +270,240 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             update.source = source_for(&author);
             update.related.push(id);
             update.status = Some(status);
-            println!(
-                "Created task revision {}",
-                journal.create_entry(&update)?.display()
+            let path = journal.create_entry(&update)?;
+            emit(
+                as_json,
+                json!({"path": path, "entry": update}),
+                format!("Created task revision {}", path.display()),
             );
         }
         Command::Search { query, category } => {
-            let journal = Journal::open(&cli.project)?;
-            for entry in journal.search(&query, category.map(Into::into))? {
-                print_entry(&entry);
-            }
+            let entries = Journal::open(&project)?.search(&query, category.map(Into::into))?;
+            emit(as_json, json!(entries), format_entries(&entries));
         }
         Command::Context { topic } => {
-            let journal = Journal::open(&cli.project)?;
-            let matches = journal.search(&topic, None)?;
-            for entry in matches.into_iter().take(10) {
-                print_entry(&entry);
-            }
+            let journal = Journal::open(&project)?;
+            let mut entries = if let Some(topic) = &topic {
+                journal.search(topic, None)?
+            } else {
+                journal.entries()?
+            };
+            entries.reverse();
+            entries.truncate(10);
+            emit(
+                as_json,
+                json!({"topic": topic, "entries": entries}),
+                format_entries(&entries),
+            );
         }
-        Command::Show { id } => {
-            let journal = Journal::open(&cli.project)?;
-            let entry = journal.get_entry(&id)?;
-            println!("# {}\n\n{}", entry.title, entry.content);
-            println!(
-                "\nID: {} | category: {} | author: {:?} {} | created: {}",
-                entry.id,
-                entry.category.as_str(),
-                entry.author.kind,
-                entry.author.name,
-                entry.created_at
+        Command::Entry {
+            command: EntryCommand::Show { id },
+        }
+        | Command::LegacyShow { id } => {
+            let entry = Journal::open(&project)?.get_entry(&id)?;
+            emit(
+                as_json,
+                json!(entry),
+                format!(
+                    "# {}\n\n{}\n\nID: {} | category: {} | author: {:?} {} | created: {}",
+                    entry.title,
+                    entry.content,
+                    entry.id,
+                    entry.category.as_str(),
+                    entry.author.kind,
+                    entry.author.name,
+                    entry.created_at
+                ),
+            );
+        }
+        Command::Recover { clean } => {
+            let journal = Journal::open(&project)?;
+            let artifacts = if clean {
+                journal.cleanup_temporary_artifacts()?.removed
+            } else {
+                journal.temporary_artifacts()?
+            };
+            let message = if artifacts.is_empty() {
+                "No stale DevJournal temporary files found".to_owned()
+            } else {
+                format!(
+                    "{} {} stale temporary file(s):\n{}",
+                    if clean { "Removed" } else { "Found" },
+                    artifacts.len(),
+                    artifacts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            emit(
+                as_json,
+                json!({"cleaned": clean, "artifacts": artifacts}),
+                message,
             );
         }
     }
     Ok(())
 }
 
-fn create(
+fn create_interactive(
     project: &PathBuf,
     category: Category,
-    args: NewArgs,
+    command: Option<NewCommand>,
+    as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let args = match command {
+        Some(NewCommand::New(args)) => args,
+        None => NewArgs {
+            title: None,
+            content: None,
+            tags: vec![],
+            author: "human".into(),
+        },
+    };
+    let title = required_single(args.title, "Title", as_json)?;
+    let content = required_multiline(args.content, "Content", as_json)?;
     let journal = Journal::open(project)?;
-    let mut entry = Entry::new(
-        args.title,
-        category,
-        args.content,
-        author_record(&args.author),
-    );
+    let mut entry = Entry::new(title, category, content, author_record(&args.author));
     entry.source = source_for(&args.author);
     entry.tags = args.tags;
-    println!("{}", journal.create_entry(&entry)?.display());
+    let path = journal.create_entry(&entry)?;
+    emit(
+        as_json,
+        json!({"path": path, "entry": entry}),
+        path.display().to_string(),
+    );
     Ok(())
 }
 
+fn required_single(
+    value: Option<String>,
+    label: &str,
+    as_json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(value) = value {
+        if !value.trim().is_empty() {
+            return Ok(value);
+        }
+    }
+    if as_json || !io::stdin().is_terminal() {
+        return Err(Box::new(Error::Invalid(format!(
+            "{label} is required; provide it as an argument (interactive prompts require a terminal)"
+        ))));
+    }
+    eprint!("{label} (type :cancel to abort): ");
+    io::stderr().flush()?;
+    let mut value = String::new();
+    io::stdin().lock().read_line(&mut value)?;
+    let value = value.trim_end().to_owned();
+    if value == ":cancel" {
+        return Err(Box::new(Error::Invalid("cancelled".into())));
+    }
+    if value.trim().is_empty() {
+        return Err(Box::new(Error::Invalid(format!("{label} cannot be empty"))));
+    }
+    Ok(value)
+}
+
+fn required_multiline(
+    value: Option<String>,
+    label: &str,
+    as_json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(value) = value {
+        if !value.trim().is_empty() {
+            return Ok(value);
+        }
+    }
+    if as_json || !io::stdin().is_terminal() {
+        return Err(Box::new(Error::Invalid(format!(
+            "{label} is required; provide --content (interactive prompts require a terminal)"
+        ))));
+    }
+    eprintln!("{label}; enter :cancel to abort or a single . on a line to finish:");
+    match read_multiline(io::stdin().lock())? {
+        Some(content) => Ok(content),
+        None => Err(Box::new(Error::Invalid(format!(
+            "{label} was empty or cancelled"
+        )))),
+    }
+}
+
+fn read_multiline<R: io::BufRead>(reader: R) -> io::Result<Option<String>> {
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line == ":cancel" {
+            return Ok(None);
+        }
+        if line == "." {
+            break;
+        }
+        lines.push(line);
+    }
+    let value = lines.join("\n");
+    Ok((!value.trim().is_empty()).then_some(value))
+}
+
+fn list(
+    project: &PathBuf,
+    category: Category,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries: Vec<_> = Journal::open(project)?
+        .entries()?
+        .into_iter()
+        .filter(|entry| entry.category == category)
+        .collect();
+    emit(as_json, json!(entries), format_entries(&entries));
+    Ok(())
+}
+
+fn emit(as_json: bool, value: Value, human: String) {
+    if as_json {
+        println!("{value}");
+    } else {
+        println!("{human}");
+    }
+}
+fn emit_error(code: &str, message: &str) {
+    eprintln!("{}", json!({"error":{"code":code,"message":message}}));
+}
+fn error_details(error: &(dyn std::error::Error + 'static)) -> (&'static str, String) {
+    if let Some(error) = error.downcast_ref::<Error>() {
+        match error {
+            Error::NotFound(item) => (
+                if item.starts_with("dj-") {
+                    "ENTRY_NOT_FOUND"
+                } else {
+                    "JOURNAL_NOT_FOUND"
+                },
+                error.to_string(),
+            ),
+            Error::AlreadyExists(_) => ("ENTRY_ALREADY_EXISTS", error.to_string()),
+            Error::Invalid(_) => ("INVALID_INPUT", error.to_string()),
+            Error::Io(_) => ("STORAGE_ERROR", error.to_string()),
+        }
+    } else {
+        ("OPERATION_FAILED", error.to_string())
+    }
+}
+fn format_entries(entries: &[Entry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                entry.id,
+                entry.created_at.format("%Y-%m-%d"),
+                entry.title,
+                entry.status.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 fn author_record(identity: &str) -> Author {
     let kind = if identity == "human" {
         AuthorType::Human
@@ -282,23 +529,21 @@ fn source_for(identity: &str) -> EntrySource {
         detail: None,
     }
 }
-fn list(project: &PathBuf, category: Category) -> Result<(), Box<dyn std::error::Error>> {
-    let journal = Journal::open(project)?;
-    for entry in journal
-        .entries()?
-        .into_iter()
-        .filter(|entry| entry.category == category)
-    {
-        print_entry(&entry);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn multiline_prompt_content_supports_unicode_and_blank_lines() {
+        assert_eq!(
+            read_multiline(Cursor::new("line one\n\nनमस्ते\n.\n"))
+                .unwrap()
+                .as_deref(),
+            Some("line one\n\nनमस्ते")
+        );
+        assert_eq!(read_multiline(Cursor::new(":cancel\n")).unwrap(), None);
+        assert_eq!(read_multiline(Cursor::new(".\n")).unwrap(), None);
     }
-    Ok(())
-}
-fn print_entry(entry: &Entry) {
-    println!(
-        "{}\t{}\t{}\t{}",
-        entry.id,
-        entry.created_at.format("%Y-%m-%d"),
-        entry.title,
-        entry.status.as_deref().unwrap_or("")
-    );
 }

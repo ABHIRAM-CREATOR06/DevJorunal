@@ -114,7 +114,8 @@ impl Entry {
         if self.author.name.trim().is_empty() {
             return Err(Error::Invalid("author name cannot be empty".into()));
         }
-        if self.id.len() > 80
+        if self.id.len() < 4
+            || self.id.len() > 80
             || !self.id.starts_with("dj-")
             || !self.id[3..]
                 .chars()

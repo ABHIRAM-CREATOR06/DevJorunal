@@ -4,7 +4,7 @@ mod journal;
 
 pub use config::{JournalConfig, ProjectConfig};
 pub use entry::{Author, AuthorType, Category, Entry, EntrySource, EntrySourceType};
-pub use journal::Journal;
+pub use journal::{Journal, RecoveryReport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -14,6 +14,8 @@ pub enum Error {
     Invalid(String),
     #[error("entry not found: {0}")]
     NotFound(String),
+    #[error("entry already exists: {0}")]
+    AlreadyExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
