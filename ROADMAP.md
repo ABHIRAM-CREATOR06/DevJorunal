@@ -21,10 +21,14 @@
 - [x] Stale temp discovery and explicit cleanup without promotion
 - [x] Duplicate and concurrent create protection
 
-## Phase 3 — Indexing and search
+## Phase 3 — Knowledge graph, indexing, and context (complete)
 
-- [ ] Rebuildable SQLite FTS5 index
-- [ ] Metadata filters and index consistency checks
+- [x] Markdown relationship records with provenance and removal tombstones
+- [x] Typed relationship model and deterministic graph traversal/path/cycle operations
+- [x] Rebuildable SQLite FTS5 index with incremental source synchronization
+- [x] Index status, verification, corrupt-index preservation, and rebuild
+- [x] Graph-aware context with depth, limits, deduplication, and relevance reasons
+- [ ] Metadata filters beyond category and query
 
 ## Phase 4 — MCP server
 
@@ -32,7 +36,8 @@
 
 ## Phase 5 — Agent continuity
 
-- [ ] Context retrieval, session summaries, related knowledge, project overview
+- [x] Deterministic graph-aware context retrieval and related knowledge
+- [ ] Session summaries and project overview generation
 
 ## Phase 6 — Zed integration
 

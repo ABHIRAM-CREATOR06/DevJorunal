@@ -14,8 +14,10 @@ Implemented `init`, `status`, `note new`, `decision new`, `session start/list`, 
 
 Entry writes stage a uniquely named file in the final directory, flush and sync it, validate a read-back parse, and publish without replacing existing IDs. Windows uses same-volume `MoveFileW`; Unix uses atomic no-clobber hard-link publication and syncs the parent directory. Failed operations clean the temp. `recover` lists matching stale temps and `recover --clean` removes them explicitly without promotion. Tests cover injected validation failure, preservation, cleanup, duplicate IDs, and concurrent creation.
 
+## Phase 3 — Knowledge graph, indexing & context (complete)
+
+Added typed, provenance-bearing Markdown relationships with tombstones for unlinking, a directed graph API with symmetric `relates_to` edges, SQLite FTS5 indexing, incremental updates, verification and rebuild recovery. Search and context use the disposable index; context can include explained graph neighbors. Added `link`, `unlink`, `relationships`, `graph`, and `index` CLI commands with JSON output. Markdown remains the source of truth, and the generated SQLite database is ignored by Git. The workspace MSRV is Rust 1.89 to support the bundled SQLite dependency.
+
 ## Verification
 
-`cargo test --workspace --offline` passed (14 tests); `cargo fmt --all -- --check` passed; `cargo clippy --workspace --all-targets --offline -- -D warnings` passed. CLI smoke check created a project and note, then parsed JSON status, search, context, session list, task list, and recovery output. The workspace is on OneDrive, so Cargo reports incremental-cache hard-link fallback warnings; these do not affect the build or tests.
-
-Next: SQLite FTS5 indexing and rebuild operations (Phase 3). MCP and Zed remain future phases.
+`cargo test --workspace --offline` passed (26 tests); `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed. CLI integration coverage exercises JSON relationship, graph, index, and context commands end to end. The workspace is on OneDrive, so Cargo may report incremental-cache hard-link fallback warnings; these do not affect the build or tests. MCP and Zed remain future phases.

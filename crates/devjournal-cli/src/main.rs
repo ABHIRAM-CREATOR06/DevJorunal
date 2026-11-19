@@ -6,8 +6,9 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use devjournal_core::{
-    Author, AuthorType, Category, Entry, EntrySource, EntrySourceType, Error, Journal,
-    JournalConfig,
+    Author, AuthorType, Category, ContextItem, ContextReason, Entry, EntrySource, EntrySourceType,
+    Error, Journal, JournalConfig, KnowledgeGraph, Relationship, RelationshipType, SearchIndex,
+    retrieve_context,
 };
 use serde_json::{Value, json};
 
@@ -55,9 +56,44 @@ enum Command {
         query: String,
         #[arg(long, value_enum)]
         category: Option<CategoryArg>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     Context {
         topic: Option<String>,
+        #[arg(long = "topic")]
+        topic_option: Option<String>,
+        #[arg(long)]
+        entry: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    Link {
+        source: String,
+        target: String,
+        #[arg(long = "type", value_enum)]
+        kind: RelationshipTypeArg,
+        #[arg(long, default_value = "human")]
+        author: String,
+    },
+    Unlink {
+        relationship_id: String,
+        #[arg(long, default_value = "human")]
+        author: String,
+    },
+    Relationships {
+        #[command(subcommand)]
+        command: RelationshipsCommand,
+    },
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
+    },
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
     },
     Entry {
         #[command(subcommand)]
@@ -71,6 +107,44 @@ enum Command {
         #[arg(long, help = "Delete only recognized stale DevJournal temporary files")]
         clean: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum RelationshipsCommand {
+    List {
+        entry_id: String,
+        #[arg(long)]
+        incoming: bool,
+        #[arg(long = "type", value_enum)]
+        kind: Option<RelationshipTypeArg>,
+    },
+}
+#[derive(Subcommand)]
+enum GraphCommand {
+    Neighbors {
+        entry_id: String,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long = "type", value_enum)]
+        kind: Option<RelationshipTypeArg>,
+    },
+    Path {
+        source_id: String,
+        target_id: String,
+    },
+    Related {
+        entry_id: String,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+    },
+    Stats,
+}
+#[derive(Subcommand)]
+enum IndexCommand {
+    Status,
+    Verify,
+    Rebuild,
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +198,41 @@ enum CategoryArg {
     Retrospective,
     Convention,
     Question,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RelationshipTypeArg {
+    #[value(name = "relates_to")]
+    RelatesTo,
+    Implements,
+    #[value(name = "depends_on")]
+    DependsOn,
+    Supersedes,
+    #[value(name = "discovered_during")]
+    DiscoveredDuring,
+    #[value(name = "caused_by")]
+    CausedBy,
+    Resolves,
+    References,
+    #[value(name = "derived_from")]
+    DerivedFrom,
+    Blocks,
+}
+impl From<RelationshipTypeArg> for RelationshipType {
+    fn from(value: RelationshipTypeArg) -> Self {
+        match value {
+            RelationshipTypeArg::RelatesTo => Self::RelatesTo,
+            RelationshipTypeArg::Implements => Self::Implements,
+            RelationshipTypeArg::DependsOn => Self::DependsOn,
+            RelationshipTypeArg::Supersedes => Self::Supersedes,
+            RelationshipTypeArg::DiscoveredDuring => Self::DiscoveredDuring,
+            RelationshipTypeArg::CausedBy => Self::CausedBy,
+            RelationshipTypeArg::Resolves => Self::Resolves,
+            RelationshipTypeArg::References => Self::References,
+            RelationshipTypeArg::DerivedFrom => Self::DerivedFrom,
+            RelationshipTypeArg::Blocks => Self::Blocks,
+        }
+    }
 }
 impl From<CategoryArg> for Category {
     fn from(value: CategoryArg) -> Self {
@@ -277,24 +386,216 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 format!("Created task revision {}", path.display()),
             );
         }
-        Command::Search { query, category } => {
-            let entries = Journal::open(&project)?.search(&query, category.map(Into::into))?;
+        Command::Search {
+            query,
+            category,
+            limit,
+        } => {
+            let journal = Journal::open(&project)?;
+            let mut index = SearchIndex::open(&journal)?;
+            index.sync(&journal)?;
+            let entries = index
+                .search_ids(&query, category.map(Into::into), limit.min(100))?
+                .iter()
+                .map(|id| journal.get_entry(id))
+                .collect::<Result<Vec<_>, _>>()?;
             emit(as_json, json!(entries), format_entries(&entries));
         }
-        Command::Context { topic } => {
+        Command::Context {
+            topic,
+            topic_option,
+            entry,
+            depth,
+            limit,
+        } => {
+            if topic.is_some() && topic_option.is_some() {
+                return Err(Box::new(Error::Invalid(
+                    "provide the context topic once, either positionally or with --topic".into(),
+                )));
+            }
+            let topic = topic.or(topic_option);
             let journal = Journal::open(&project)?;
-            let mut entries = if let Some(topic) = &topic {
-                journal.search(topic, None)?
-            } else {
-                journal.entries()?
-            };
-            entries.reverse();
-            entries.truncate(10);
+            let results =
+                retrieve_context(&journal, topic.as_deref(), entry.as_deref(), depth, limit)?;
             emit(
                 as_json,
-                json!({"topic": topic, "entries": entries}),
-                format_entries(&entries),
+                json!({"topic": topic, "entry_id": entry, "depth": depth, "results": results}),
+                format_context(&results),
             );
+        }
+        Command::Link {
+            source,
+            target,
+            kind,
+            author,
+        } => {
+            let journal = Journal::open(&project)?;
+            let relationship = Relationship::new(
+                source,
+                target,
+                kind.into(),
+                author_record(&author),
+                source_for(&author),
+            );
+            let path = journal.create_relationship(&relationship)?;
+            emit(
+                as_json,
+                json!({"path": path, "relationship": relationship}),
+                path.display().to_string(),
+            );
+        }
+        Command::Unlink {
+            relationship_id,
+            author,
+        } => {
+            let journal = Journal::open(&project)?;
+            let path = journal.unlink_relationship(
+                &relationship_id,
+                author_record(&author),
+                source_for(&author),
+            )?;
+            emit(
+                as_json,
+                json!({"relationship_id": relationship_id, "tombstone": path}),
+                format!("Unlinked {relationship_id}"),
+            );
+        }
+        Command::Relationships {
+            command:
+                RelationshipsCommand::List {
+                    entry_id,
+                    incoming,
+                    kind,
+                },
+        } => {
+            let journal = Journal::open(&project)?;
+            journal.get_entry(&entry_id)?;
+            let kind = kind.map(Into::into);
+            let relationships: Vec<_> = journal
+                .relationships()?
+                .into_iter()
+                .filter(|relation| {
+                    (if incoming {
+                        relation.target_id == entry_id
+                            || (relation.kind.is_symmetric() && relation.source_id == entry_id)
+                    } else {
+                        relation.source_id == entry_id
+                            || (relation.kind.is_symmetric() && relation.target_id == entry_id)
+                    }) && kind.is_none_or(|filter| relation.kind == filter)
+                })
+                .collect();
+            emit(
+                as_json,
+                json!(relationships),
+                format_relationships(&relationships),
+            );
+        }
+        Command::Graph { command } => {
+            let journal = Journal::open(&project)?;
+            let graph = indexed_graph(&journal)?;
+            match command {
+                GraphCommand::Neighbors {
+                    entry_id,
+                    depth,
+                    kind,
+                } => {
+                    let hits = graph.neighbors(&entry_id, depth, kind.map(Into::into))?;
+                    let results = graph_hits_json(&journal, &hits)?;
+                    emit(as_json, json!(results), format_graph_hits(&journal, &hits)?);
+                }
+                GraphCommand::Related { entry_id, depth } => {
+                    let hits = graph.neighbors(&entry_id, depth, None)?;
+                    let results = graph_hits_json(&journal, &hits)?;
+                    emit(as_json, json!(results), format_graph_hits(&journal, &hits)?);
+                }
+                GraphCommand::Path {
+                    source_id,
+                    target_id,
+                } => {
+                    let path = graph.path(&source_id, &target_id)?;
+                    let entries = path
+                        .as_ref()
+                        .map(|ids| {
+                            ids.iter()
+                                .map(|id| journal.get_entry(id))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .transpose()?;
+                    emit(
+                        as_json,
+                        json!({"source_id":source_id,"target_id":target_id,"path":entries}),
+                        path.map(|ids| ids.join(" -> "))
+                            .unwrap_or_else(|| "No path found".into()),
+                    );
+                }
+                GraphCommand::Stats => {
+                    let stats = graph.stats();
+                    emit(
+                        as_json,
+                        json!(stats),
+                        format!(
+                            "{} entries, {} relationships; directed cycle: {}",
+                            stats.nodes, stats.relationships, stats.has_directed_cycle
+                        ),
+                    );
+                }
+            }
+        }
+        Command::Index { command } => {
+            let journal = Journal::open(&project)?;
+            match command {
+                IndexCommand::Status => {
+                    let status = SearchIndex::status(&journal)?;
+                    emit(
+                        as_json,
+                        json!(status),
+                        format!(
+                            "Index {}: {} entries, {} relationships",
+                            if status.available {
+                                "available"
+                            } else {
+                                "not built"
+                            },
+                            status.entries,
+                            status.relationships
+                        ),
+                    );
+                }
+                IndexCommand::Verify => {
+                    let report = SearchIndex::verify_existing(&journal)?;
+                    emit(
+                        as_json,
+                        json!(report),
+                        if report.consistent {
+                            "Index is consistent".into()
+                        } else {
+                            "Index needs rebuild or update".into()
+                        },
+                    );
+                }
+                IndexCommand::Rebuild => {
+                    let index = SearchIndex::rebuild(&journal)?;
+                    let report = index.verify(&journal)?;
+                    emit(
+                        as_json,
+                        json!({"status":SearchIndex::status(&journal)?,"verification":report}),
+                        "Index rebuilt from Markdown".into(),
+                    );
+                }
+                IndexCommand::Update => {
+                    let mut index = SearchIndex::open(&journal)?;
+                    index.sync(&journal)?;
+                    let status = SearchIndex::status(&journal)?;
+                    emit(
+                        as_json,
+                        json!(status),
+                        format!(
+                            "Index updated: {} entries, {} relationships",
+                            status.entries, status.relationships
+                        ),
+                    );
+                }
+            }
         }
         Command::Entry {
             command: EntryCommand::Show { id },
@@ -382,10 +683,10 @@ fn required_single(
     label: &str,
     as_json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(value) = value {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
+    if let Some(value) = value
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
     }
     if as_json || !io::stdin().is_terminal() {
         return Err(Box::new(Error::Invalid(format!(
@@ -411,10 +712,10 @@ fn required_multiline(
     label: &str,
     as_json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(value) = value {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
+    if let Some(value) = value
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
     }
     if as_json || !io::stdin().is_terminal() {
         return Err(Box::new(Error::Invalid(format!(
@@ -460,6 +761,85 @@ fn list(
     Ok(())
 }
 
+fn indexed_graph(journal: &Journal) -> Result<KnowledgeGraph, Box<dyn std::error::Error>> {
+    let mut index = SearchIndex::open(journal)?;
+    index.sync(journal)?;
+    Ok(index.graph()?)
+}
+
+fn format_relationships(relationships: &[Relationship]) -> String {
+    relationships
+        .iter()
+        .map(|relation| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                relation.id,
+                relation.source_id,
+                relation.kind.as_str(),
+                relation.target_id,
+                relation.author.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_graph_hits(
+    journal: &Journal,
+    hits: &[devjournal_core::TraversalHit],
+) -> Result<String, Box<dyn std::error::Error>> {
+    hits.iter()
+        .map(|hit| {
+            Ok(format!(
+                "{}\tdepth={}\t{}\t{}",
+                hit.entry_id,
+                hit.depth,
+                hit.relationship_type.as_str(),
+                journal.get_entry(&hit.entry_id)?.title
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
+        .map(|lines| lines.join("\n"))
+}
+
+fn graph_hits_json(
+    journal: &Journal,
+    hits: &[devjournal_core::TraversalHit],
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    hits.iter().map(|hit| {
+        let entry = journal.get_entry(&hit.entry_id)?;
+        Ok(json!({"entry":entry,"depth":hit.depth,"from_entry_id":hit.from_id,"relationship_id":hit.relationship_id,"relationship_type":hit.relationship_type}))
+    }).collect()
+}
+
+fn format_context(results: &[ContextItem]) -> String {
+    results
+        .iter()
+        .map(|item| {
+            let reason = match &item.reason {
+                ContextReason::DirectTextMatch => "direct text match".to_owned(),
+                ContextReason::RequestedEntry => "requested entry".to_owned(),
+                ContextReason::RecentProjectActivity => "recent project activity".to_owned(),
+                ContextReason::Relationship {
+                    relationship_type,
+                    from_entry_id,
+                    ..
+                } => format!("via {} from {}", relationship_type.as_str(), from_entry_id),
+            };
+            format!(
+                "{}\tdepth={}\t{}\t[{:?}: {}]\n{}",
+                item.entry.id,
+                item.depth,
+                reason,
+                item.entry.author.kind,
+                item.entry.author.name,
+                item.entry.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn emit(as_json: bool, value: Value, human: String) {
     if as_json {
         println!("{value}");
@@ -484,6 +864,7 @@ fn error_details(error: &(dyn std::error::Error + 'static)) -> (&'static str, St
             Error::AlreadyExists(_) => ("ENTRY_ALREADY_EXISTS", error.to_string()),
             Error::Invalid(_) => ("INVALID_INPUT", error.to_string()),
             Error::Io(_) => ("STORAGE_ERROR", error.to_string()),
+            Error::Index(_) | Error::Sqlite(_) => ("INDEX_ERROR", error.to_string()),
         }
     } else {
         ("OPERATION_FAILED", error.to_string())

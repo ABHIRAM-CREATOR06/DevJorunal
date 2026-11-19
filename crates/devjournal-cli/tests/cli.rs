@@ -170,3 +170,147 @@ fn json_lists_context_and_temp_recovery_are_structured() {
     );
     assert!(!temp.exists());
 }
+
+#[test]
+fn graph_relationship_index_and_context_commands_work_end_to_end() {
+    let project = TempDir::new().unwrap();
+    init(&project);
+    let note = run(
+        &project,
+        &[
+            "note",
+            "new",
+            "Auth implementation",
+            "--content",
+            "authentication behavior",
+            "--json",
+        ],
+    );
+    let note: Value = serde_json::from_slice(&note.stdout).unwrap();
+    let source = note["entry"]["id"].as_str().unwrap();
+    let decision = run(
+        &project,
+        &[
+            "decision",
+            "new",
+            "Token strategy",
+            "--content",
+            "narrowly scoped token claims",
+            "--json",
+        ],
+    );
+    let decision: Value = serde_json::from_slice(&decision.stdout).unwrap();
+    let target = decision["entry"]["id"].as_str().unwrap();
+
+    let link = run(
+        &project,
+        &["link", source, target, "--type", "implements", "--json"],
+    );
+    assert!(
+        link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let relationship_id =
+        serde_json::from_slice::<Value>(&link.stdout).unwrap()["relationship"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let outgoing = run(&project, &["relationships", "list", source, "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&outgoing.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let incoming = run(
+        &project,
+        &["relationships", "list", target, "--incoming", "--json"],
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&incoming.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let verify = run(&project, &["index", "verify", "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&verify.stdout).unwrap()["consistent"],
+        false
+    );
+    let rebuild = run(&project, &["index", "rebuild", "--json"]);
+    assert!(
+        serde_json::from_slice::<Value>(&rebuild.stdout).unwrap()["verification"]["consistent"]
+            .as_bool()
+            .unwrap()
+    );
+
+    let neighbors = run(
+        &project,
+        &["graph", "neighbors", source, "--depth", "1", "--json"],
+    );
+    let neighbor_items = serde_json::from_slice::<Value>(&neighbors.stdout).unwrap();
+    assert_eq!(neighbor_items[0]["entry"]["id"], target);
+    let context = run(
+        &project,
+        &[
+            "context",
+            "--topic",
+            "authentication",
+            "--depth",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(
+        context.status.success(),
+        "{}",
+        String::from_utf8_lossy(&context.stderr)
+    );
+    let context: Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert!(
+        context["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reason"]["kind"] == "relationship")
+    );
+
+    let path = run(&project, &["graph", "path", source, target, "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&path.stdout).unwrap()["path"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let db = project.path().join(".devjournal/index.sqlite3");
+    std::fs::remove_file(db).unwrap();
+    assert!(run(&project, &["index", "rebuild"]).status.success());
+    let verified = run(&project, &["index", "verify", "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&verified.stdout).unwrap()["consistent"],
+        true
+    );
+
+    let unlinked = run(&project, &["unlink", &relationship_id, "--json"]);
+    assert!(
+        unlinked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unlinked.stderr)
+    );
+    let now_empty = run(&project, &["relationships", "list", source, "--json"]);
+    assert!(
+        serde_json::from_slice::<Value>(&now_empty.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

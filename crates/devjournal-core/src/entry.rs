@@ -66,6 +66,17 @@ pub enum EntrySourceType {
     System,
 }
 
+impl EntrySourceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Agent => "agent",
+            Self::Imported => "imported",
+            Self::System => "system",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
@@ -127,6 +138,9 @@ impl Entry {
         }
         if self.tags.iter().any(|tag| tag.trim().is_empty()) {
             return Err(Error::Invalid("tags cannot be empty".into()));
+        }
+        for related_id in &self.related {
+            crate::relationship::validate_entry_id(related_id)?;
         }
         if self.updated_at < self.created_at {
             return Err(Error::Invalid(

@@ -5,7 +5,10 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::{Category, Entry, Error, JournalConfig, Result};
+use crate::{
+    Author, Category, Entry, EntrySource, Error, JournalConfig, Relationship, RelationshipRemoval,
+    Result,
+};
 
 pub struct Journal {
     root: PathBuf,
@@ -31,12 +34,18 @@ impl Journal {
             "tasks",
             "knowledge",
             "entries",
+            "relationships",
+            "relationship-removals",
         ] {
             fs::create_dir_all(root.join(dir))?;
         }
         let config_path = root.join("config.toml");
         if !config_path.exists() {
             config.write(&config_path)?;
+        }
+        let ignore_path = root.join(".gitignore");
+        if !ignore_path.exists() {
+            fs::write(ignore_path, "/index.sqlite3*\n")?;
         }
         for (name, body) in [
             (
@@ -75,6 +84,12 @@ impl Journal {
 
     pub fn create_entry(&self, entry: &Entry) -> Result<PathBuf> {
         entry.validate()?;
+        for related_id in &entry.related {
+            if related_id == &entry.id {
+                return Err(Error::Invalid("entry cannot relate to itself".into()));
+            }
+            self.get_entry(related_id)?;
+        }
         let path = self.entry_path(&entry.id, entry.category)?;
         let parent = path.parent().expect("entry path has parent");
         fs::create_dir_all(parent)?;
@@ -92,9 +107,238 @@ impl Journal {
         Ok(path)
     }
 
+    pub fn create_relationship(&self, relationship: &Relationship) -> Result<PathBuf> {
+        relationship.validate()?;
+        self.get_entry(&relationship.source_id)?;
+        self.get_entry(&relationship.target_id)?;
+        for existing in self.relationships()? {
+            if same_edge(&existing, relationship) {
+                return Err(Error::AlreadyExists(format!(
+                    "{}:{}->{}",
+                    relationship.kind.as_str(),
+                    relationship.source_id,
+                    relationship.target_id
+                )));
+            }
+        }
+        let path = self
+            .root
+            .join("relationships")
+            .join(format!("{}.md", relationship.id));
+        write_new(&path, relationship.to_markdown()?.as_bytes(), |text| {
+            let parsed = Relationship::from_markdown(text)?;
+            if parsed != *relationship {
+                return Err(Error::Invalid(
+                    "serialized relationship failed validation".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(path)
+    }
+
+    pub fn get_relationship(&self, id: &str) -> Result<Relationship> {
+        crate::relationship::validate_relationship_id(id)?;
+        let path = self.root.join("relationships").join(format!("{id}.md"));
+        if !path.is_file() {
+            return Err(Error::NotFound(id.to_owned()));
+        }
+        Relationship::from_markdown(&fs::read_to_string(path)?)
+    }
+
+    pub fn unlink_relationship(
+        &self,
+        id: &str,
+        author: Author,
+        provenance: EntrySource,
+    ) -> Result<PathBuf> {
+        let relationship = self.get_relationship(id)?;
+        if self
+            .root
+            .join("relationship-removals")
+            .join(format!("{id}.md"))
+            .exists()
+        {
+            return Err(Error::AlreadyExists(format!(
+                "removal for relationship {id}"
+            )));
+        }
+        let removal = RelationshipRemoval::new(relationship.id, author, provenance);
+        let path = self
+            .root
+            .join("relationship-removals")
+            .join(format!("{id}.md"));
+        write_new(&path, removal.to_markdown()?.as_bytes(), |text| {
+            let parsed = RelationshipRemoval::from_markdown(text)?;
+            if parsed != removal {
+                return Err(Error::Invalid(
+                    "serialized relationship removal failed validation".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(path)
+    }
+
+    pub fn relationships(&self) -> Result<Vec<Relationship>> {
+        let entries = self.entries()?;
+        let ids: std::collections::HashSet<_> =
+            entries.iter().map(|entry| entry.id.as_str()).collect();
+        let mut removed = std::collections::HashSet::new();
+        for item in fs::read_dir(self.root.join("relationship-removals"))? {
+            let path = item?.path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                let removal = RelationshipRemoval::from_markdown(&fs::read_to_string(&path)?)?;
+                let filename = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default();
+                if filename != removal.relationship_id {
+                    return Err(Error::Invalid(format!(
+                        "relationship-removal filename does not match {}",
+                        removal.relationship_id
+                    )));
+                }
+                if !removed.insert(removal.relationship_id.clone()) {
+                    return Err(Error::Invalid(format!(
+                        "duplicate relationship removal for {}",
+                        removal.relationship_id
+                    )));
+                }
+            }
+        }
+        let mut known_relationship_ids = std::collections::HashSet::new();
+        let mut explicit_relationships = Vec::new();
+        for item in fs::read_dir(self.root.join("relationships"))? {
+            let path = item?.path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                let relation = Relationship::from_markdown(&fs::read_to_string(&path)?)?;
+                let filename = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default();
+                if filename != relation.id {
+                    return Err(Error::Invalid(format!(
+                        "relationship filename does not match {}",
+                        relation.id
+                    )));
+                }
+                if !known_relationship_ids.insert(relation.id.clone()) {
+                    return Err(Error::Invalid(format!(
+                        "duplicate relationship id {}",
+                        relation.id
+                    )));
+                }
+                if !removed.contains(&relation.id) {
+                    validate_endpoints(&relation, &ids)?;
+                    explicit_relationships.push(relation);
+                }
+            }
+        }
+        if let Some(id) = removed
+            .iter()
+            .find(|id| !known_relationship_ids.contains(*id))
+        {
+            return Err(Error::Invalid(format!(
+                "removal references missing relationship {id}"
+            )));
+        }
+        let mut relationships = explicit_relationships.clone();
+        let mut legacy_edges = Vec::new();
+        for entry in &entries {
+            for related_id in &entry.related {
+                validate_id(related_id)?;
+                if !ids.contains(related_id.as_str()) {
+                    return Err(Error::Invalid(format!(
+                        "entry {} references missing related entry {}",
+                        entry.id, related_id
+                    )));
+                }
+                let relation = crate::relationship::legacy_relationship(entry, related_id);
+                if explicit_relationships
+                    .iter()
+                    .any(|existing| same_edge(existing, &relation))
+                {
+                    continue;
+                }
+                if legacy_edges
+                    .iter()
+                    .any(|existing| same_edge(existing, &relation))
+                {
+                    return Err(Error::Invalid(format!(
+                        "entry {} contains duplicate related ids",
+                        entry.id
+                    )));
+                }
+                legacy_edges.push(relation.clone());
+                relationships.push(relation);
+            }
+        }
+        relationships.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(relationships)
+    }
+
+    pub fn entry_files(&self) -> Result<Vec<(Entry, PathBuf, Vec<u8>)>> {
+        let mut records = Vec::new();
+        for folder in entry_folders() {
+            for item in fs::read_dir(self.root.join(folder))? {
+                let path = item?.path();
+                if path.extension().is_some_and(|extension| extension == "md") {
+                    let bytes = fs::read(&path)?;
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|error| Error::Invalid(error.to_string()))?;
+                    records.push((Entry::from_markdown(text)?, path, bytes));
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn index_path(&self) -> PathBuf {
+        self.root.join("index.sqlite3")
+    }
+
+    pub(crate) fn ensure_index_ignored(&self) -> Result<()> {
+        let path = self.root.join(".gitignore");
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if contents
+            .lines()
+            .any(|line| matches!(line.trim(), "/index.sqlite3*" | "index.sqlite3*"))
+        {
+            return Ok(());
+        }
+        let prefix = if contents.is_empty() || contents.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(format!("{prefix}/index.sqlite3*\n").as_bytes())?;
+        Ok(())
+    }
+
     pub fn temporary_artifacts(&self) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        for folder in entry_folders() {
+        for folder in [
+            "sessions",
+            "decisions",
+            "notes",
+            "research",
+            "debugging",
+            "meetings",
+            "tasks",
+            "entries",
+            "relationships",
+            "relationship-removals",
+        ] {
             for item in fs::read_dir(self.root.join(folder))? {
                 let path = item?.path();
                 if path.is_file() && is_temp_artifact(&path) {
@@ -215,7 +459,33 @@ fn is_temp_artifact(path: &Path) -> bool {
     let Some((id, nonce)) = rest.split_once(".tmp-") else {
         return false;
     };
-    validate_id(id).is_ok() && Uuid::parse_str(nonce).is_ok()
+    (validate_id(id).is_ok() || crate::relationship::validate_relationship_id(id).is_ok())
+        && Uuid::parse_str(nonce).is_ok()
+}
+
+fn same_edge(left: &Relationship, right: &Relationship) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.kind.is_symmetric() {
+        (left.source_id == right.source_id && left.target_id == right.target_id)
+            || (left.source_id == right.target_id && left.target_id == right.source_id)
+    } else {
+        left.source_id == right.source_id && left.target_id == right.target_id
+    }
+}
+
+fn validate_endpoints(
+    relation: &Relationship,
+    ids: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    if !ids.contains(relation.source_id.as_str()) || !ids.contains(relation.target_id.as_str()) {
+        return Err(Error::Invalid(format!(
+            "relationship {} references a missing entry",
+            relation.id
+        )));
+    }
+    Ok(())
 }
 
 fn write_new<F>(path: &Path, contents: &[u8], validate: F) -> Result<()>
@@ -291,21 +561,48 @@ fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileW;
 
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let from_display = from.display().to_string();
+    let to_display = to.display().to_string();
+    let from_name = extended_windows_path(from);
+    let to_name = extended_windows_path(to);
+    let from_exists = from.exists();
+    let parent_exists = to.parent().is_some_and(Path::is_dir);
+    let from: Vec<u16> = from_name.encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to_name.encode_wide().chain(Some(0)).collect();
     // MoveFileW on the same volume is atomic and fails when `to` already exists.
     let result = unsafe { MoveFileW(from.as_ptr(), to.as_ptr()) };
     if result == 0 {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "publishing {} (exists={from_exists}) to {} (parent exists={parent_exists}): {error}",
+                from_display, to_display
+            ),
+        ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn extended_windows_path(path: &Path) -> std::ffi::OsString {
+    let text = path.as_os_str().to_string_lossy();
+    if text.starts_with(r"\\?\") || !path.is_absolute() {
+        path.as_os_str().to_owned()
+    } else if let Some(unc) = text.strip_prefix(r"\\") {
+        std::ffi::OsString::from(format!(r"\\?\UNC\{unc}"))
+    } else {
+        std::ffi::OsString::from(format!(r"\\?\{text}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Author, AuthorType, Entry};
+    use crate::{
+        Author, AuthorType, Entry, EntrySource, EntrySourceType, Relationship, RelationshipType,
+    };
 
     #[test]
     fn initializes_and_round_trips_human_entry() {
@@ -418,5 +715,95 @@ mod tests {
             kind: AuthorType::Human,
             name: "Ada".into(),
         }
+    }
+
+    #[test]
+    fn persists_relationship_provenance_and_unlinks_with_a_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::init(dir.path(), JournalConfig::defaults("relations")).unwrap();
+        let first = Entry::new("Decision", Category::Decision, "chosen", author());
+        let second = Entry::new(
+            "Implementation",
+            Category::Note,
+            "uses the decision",
+            author(),
+        );
+        journal.create_entry(&first).unwrap();
+        journal.create_entry(&second).unwrap();
+        let source = EntrySource {
+            kind: EntrySourceType::Manual,
+            detail: Some("reviewed in planning".into()),
+        };
+        let relation = Relationship::new(
+            first.id.clone(),
+            second.id.clone(),
+            RelationshipType::RelatesTo,
+            author(),
+            source.clone(),
+        );
+        journal.create_relationship(&relation).unwrap();
+        let loaded = journal.relationships().unwrap();
+        assert_eq!(loaded, vec![relation.clone()]);
+        assert_eq!(loaded[0].provenance, source);
+        assert!(journal.root.join("relationship-removals").is_dir());
+        assert!(
+            journal
+                .create_relationship(&Relationship::new(
+                    second.id.clone(),
+                    first.id.clone(),
+                    RelationshipType::RelatesTo,
+                    author(),
+                    EntrySource {
+                        kind: EntrySourceType::Manual,
+                        detail: None
+                    }
+                ))
+                .is_err()
+        );
+
+        journal
+            .unlink_relationship(
+                &relation.id,
+                author(),
+                EntrySource {
+                    kind: EntrySourceType::Manual,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        assert!(journal.relationships().unwrap().is_empty());
+        assert!(
+            journal
+                .root
+                .join("relationships")
+                .join(format!("{}.md", relation.id))
+                .exists()
+        );
+        assert!(
+            journal
+                .root
+                .join("relationship-removals")
+                .join(format!("{}.md", relation.id))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn rejects_relationships_with_missing_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::init(dir.path(), JournalConfig::defaults("relations")).unwrap();
+        let first = Entry::new("Entry", Category::Note, "body", author());
+        journal.create_entry(&first).unwrap();
+        let relation = Relationship::new(
+            first.id.clone(),
+            "dj-missing",
+            RelationshipType::References,
+            author(),
+            EntrySource {
+                kind: EntrySourceType::Manual,
+                detail: None,
+            },
+        );
+        assert!(journal.create_relationship(&relation).is_err());
     }
 }
