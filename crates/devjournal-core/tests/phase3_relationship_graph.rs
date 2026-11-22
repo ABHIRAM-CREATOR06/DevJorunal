@@ -86,6 +86,34 @@ fn relationship_records_round_trip_with_provenance_and_reject_invalid_links() {
 }
 
 #[test]
+fn task_history_recognizes_legacy_same_title_follow_up_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal =
+        Journal::init(dir.path(), JournalConfig::defaults("legacy-task-history")).unwrap();
+    let original = Entry::new(
+        "Ship search",
+        Category::Task,
+        "Add metadata filters",
+        author(AuthorType::Human, "Ada"),
+    );
+    journal.create_entry(&original).unwrap();
+    let mut follow_up = Entry::new(
+        original.title.clone(),
+        Category::Task,
+        original.content.clone(),
+        author(AuthorType::Human, "Ada"),
+    );
+    follow_up.related.push(original.id.clone());
+    follow_up.status = Some("in_progress".into());
+    journal.create_entry(&follow_up).unwrap();
+
+    let history = journal.entry_history(&follow_up.id).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].id, original.id);
+    assert_eq!(history[1].id, follow_up.id);
+}
+
+#[test]
 fn graph_queries_cover_direction_depth_paths_cycles_and_limits() {
     let nodes = [
         "dj-issue",
@@ -146,4 +174,26 @@ fn graph_queries_cover_direction_depth_paths_cycles_and_limits() {
     )
     .unwrap();
     assert!(cycle.has_directed_cycle());
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_rejects_symlinked_entry_files() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::init(dir.path(), JournalConfig::defaults("symlink-guard")).unwrap();
+    let entry = Entry::new(
+        "Regular entry",
+        Category::Note,
+        "stored in the journal",
+        author(AuthorType::Human, "Ada"),
+    );
+    let stored = journal.create_entry(&entry).unwrap();
+    let external = dir.path().join("outside.md");
+    std::fs::copy(stored, &external).unwrap();
+    symlink(external, journal.root().join("notes/dj-symlinked.md")).unwrap();
+
+    assert!(journal.get_entry("dj-symlinked").is_err());
+    assert!(journal.entries().is_err());
 }

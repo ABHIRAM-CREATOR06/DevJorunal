@@ -10,8 +10,8 @@ pub use config::{JournalConfig, ProjectConfig};
 pub use context::{ContextItem, ContextReason, retrieve_context};
 pub use entry::{Author, AuthorType, Category, Entry, EntrySource, EntrySourceType};
 pub use graph::{GraphStats, KnowledgeGraph, TraversalHit};
-pub use index::{IndexStatus, IndexVerification, SearchIndex};
-pub use journal::{Journal, RecoveryReport};
+pub use index::{IndexStatus, IndexVerification, SearchFilters, SearchIndex};
+pub use journal::{Journal, ProjectOverview, RecoveryReport, SessionSummary};
 pub use relationship::{Relationship, RelationshipRemoval, RelationshipType};
 
 #[derive(Debug, thiserror::Error)]

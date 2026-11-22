@@ -1,5 +1,6 @@
 use std::process::{Command, Output};
 
+use devjournal_core::{Author, AuthorType, Category, Entry, Journal, JournalConfig};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -312,5 +313,199 @@ fn graph_relationship_index_and_context_commands_work_end_to_end() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn entry_revisions_are_append_only_and_task_list_groups_history() {
+    let project = TempDir::new().unwrap();
+    let journal = Journal::init(project.path(), JournalConfig::defaults("revision-test")).unwrap();
+    let author = Author {
+        kind: AuthorType::Human,
+        name: "Ada".into(),
+    };
+    let mut task = Entry::new("Ship search", Category::Task, "Add filters", author.clone());
+    task.tags.push("search".into());
+    task.status = Some("todo".into());
+    journal.create_entry(&task).unwrap();
+    let note = Entry::new("Search design", Category::Note, "Initial design", author);
+    journal.create_entry(&note).unwrap();
+
+    let first_update = run(
+        &project,
+        &["task", "update", &task.id, "in_progress", "--json"],
+    );
+    assert!(
+        first_update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_update.stderr)
+    );
+    let first_update: Value = serde_json::from_slice(&first_update.stdout).unwrap();
+    let first_revision_id = first_update["entry"]["id"].as_str().unwrap();
+    assert_eq!(first_update["supersedes"]["type"], "supersedes");
+    assert_eq!(first_update["entry"]["tags"][0], "search");
+
+    let second_update = run(
+        &project,
+        &["task", "update", first_revision_id, "done", "--json"],
+    );
+    assert!(
+        second_update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_update.stderr)
+    );
+    let second_update: Value = serde_json::from_slice(&second_update.stdout).unwrap();
+    let newest_id = second_update["entry"]["id"].as_str().unwrap();
+
+    let task_list = run(&project, &["task", "list", "--json"]);
+    assert!(
+        task_list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&task_list.stderr)
+    );
+    let groups: Value = serde_json::from_slice(&task_list.stdout).unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["current"]["id"], newest_id);
+    assert_eq!(groups[0]["current"]["status"], "done");
+    assert_eq!(groups[0]["history"].as_array().unwrap().len(), 3);
+
+    let revised = run(
+        &project,
+        &[
+            "entry",
+            "revise",
+            &note.id,
+            "--content",
+            "Use indexed search filters",
+            "--json",
+        ],
+    );
+    assert!(
+        revised.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+    let revised: Value = serde_json::from_slice(&revised.stdout).unwrap();
+    assert_ne!(revised["entry"]["id"], note.id);
+    assert_eq!(revised["entry"]["content"], "Use indexed search filters");
+    assert_eq!(
+        journal.get_entry(&note.id).unwrap().content,
+        "Initial design"
+    );
+
+    let history = run(&project, &["entry", "history", &note.id, "--json"]);
+    assert!(history.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&history.stdout).unwrap()["revisions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn search_metadata_filters_work_through_the_cli() {
+    let project = TempDir::new().unwrap();
+    init(&project);
+    let created = run(
+        &project,
+        &[
+            "note",
+            "new",
+            "Credential record",
+            "--content",
+            "credential expiry",
+            "--tags",
+            "security",
+            "--author",
+            "Ada",
+            "--json",
+        ],
+    );
+    assert!(created.status.success());
+    let output = run(
+        &project,
+        &[
+            "search",
+            "credential",
+            "--author",
+            "Ada",
+            "--tag",
+            "security",
+            "--created-after",
+            "2026-11-18T00:00:00Z",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn overview_and_session_summary_commands_return_deterministic_records() {
+    let project = TempDir::new().unwrap();
+    init(&project);
+    let session = run(&project, &["session", "start", "Auth review", "--json"]);
+    assert!(session.status.success());
+    let session: Value = serde_json::from_slice(&session.stdout).unwrap();
+    let session_id = session["entry"]["id"].as_str().unwrap();
+    let decision = run(
+        &project,
+        &[
+            "decision",
+            "new",
+            "Use short-lived tokens",
+            "--content",
+            "Expire credentials quickly",
+            "--json",
+        ],
+    );
+    assert!(decision.status.success());
+    let decision: Value = serde_json::from_slice(&decision.stdout).unwrap();
+    let decision_id = decision["entry"]["id"].as_str().unwrap();
+    let link = run(
+        &project,
+        &[
+            "link",
+            decision_id,
+            session_id,
+            "--type",
+            "discovered_during",
+            "--json",
+        ],
+    );
+    assert!(link.status.success());
+
+    let summary = run(&project, &["session", "summary", session_id, "--json"]);
+    assert!(summary.status.success());
+    let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(summary["linked_entries"][0]["id"], decision_id);
+    assert!(
+        summary["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Expire credentials quickly")
+    );
+
+    let overview = run(&project, &["overview", "--json"]);
+    assert!(overview.status.success());
+    let overview: Value = serde_json::from_slice(&overview.stdout).unwrap();
+    assert_eq!(overview["overview"]["total_entries"], 2);
+    assert_eq!(overview["overview"]["entries_by_category"]["session"], 1);
+    assert_eq!(
+        overview["overview"]["recent_decisions"][0]["id"],
+        decision_id
     );
 }

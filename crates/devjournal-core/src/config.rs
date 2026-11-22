@@ -1,9 +1,10 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use crate::{Error, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProjectConfig {
     pub name: String,
     pub description: String,
@@ -33,47 +34,23 @@ impl JournalConfig {
     }
 
     pub(crate) fn write(&self, path: &Path) -> Result<()> {
-        let text = format!(
-            "[project]\nname = {}\ndescription = {}\n\n[privacy]\nlocal_only = {}\nstore_transcripts = {}\n\n[sessions]\nrequire_review = {}\nauto_create = false\n\n[agents]\nallow_writes = {}\nrequire_confirmation_for_decisions = true\n",
-            quote(&self.project.name),
-            quote(&self.project.description),
-            self.local_only,
-            self.store_transcripts,
-            self.require_review,
-            self.allow_agent_writes
-        );
+        let text = toml::to_string_pretty(&ConfigFile::from(self))
+            .map_err(|error| Error::Invalid(format!("could not encode config: {error}")))?;
         fs::write(path, text)?;
         Ok(())
     }
 
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)?;
-        let mut section = "";
-        let mut config = Self::defaults("");
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                section = &line[1..line.len() - 1];
-                continue;
-            }
-            let (key, value) = line
-                .split_once('=')
-                .ok_or_else(|| Error::Invalid(format!("invalid config line: {line}")))?;
-            let key = key.trim();
-            let value = value.trim();
-            match (section, key) {
-                ("project", "name") => config.project.name = unquote(value)?,
-                ("project", "description") => config.project.description = unquote(value)?,
-                ("privacy", "local_only") => config.local_only = parse_bool(value)?,
-                ("privacy", "store_transcripts") => config.store_transcripts = parse_bool(value)?,
-                ("sessions", "require_review") => config.require_review = parse_bool(value)?,
-                ("agents", "allow_writes") => config.allow_agent_writes = parse_bool(value)?,
-                _ => {}
-            }
-        }
+        let file: ConfigFile = toml::from_str(&text)
+            .map_err(|error| Error::Invalid(format!("invalid TOML config: {error}")))?;
+        let config = Self {
+            project: file.project,
+            local_only: file.privacy.local_only,
+            store_transcripts: file.privacy.store_transcripts,
+            require_review: file.sessions.require_review,
+            allow_agent_writes: file.agents.allow_writes,
+        };
         if config.project.name.trim().is_empty() {
             return Err(Error::Invalid("project.name is required".into()));
         }
@@ -81,30 +58,78 @@ impl JournalConfig {
     }
 }
 
-fn quote(s: &str) -> String {
-    format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-    )
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ConfigFile {
+    project: ProjectConfig,
+    privacy: PrivacyConfig,
+    sessions: SessionsConfig,
+    agents: AgentsConfig,
 }
-fn unquote(s: &str) -> Result<String> {
-    if !s.starts_with('"') || !s.ends_with('"') {
-        return Err(Error::Invalid("expected quoted string in config".into()));
+
+impl From<&JournalConfig> for ConfigFile {
+    fn from(config: &JournalConfig) -> Self {
+        Self {
+            project: config.project.clone(),
+            privacy: PrivacyConfig {
+                local_only: config.local_only,
+                store_transcripts: config.store_transcripts,
+            },
+            sessions: SessionsConfig {
+                require_review: config.require_review,
+                ..SessionsConfig::default()
+            },
+            agents: AgentsConfig {
+                allow_writes: config.allow_agent_writes,
+                ..AgentsConfig::default()
+            },
+        }
     }
-    serde_json_unescape(&s[1..s.len() - 1])
 }
-fn serde_json_unescape(s: &str) -> Result<String> {
-    // TOML basic strings and JSON strings share the escapes emitted by quote().
-    let quoted = format!("\"{s}\"");
-    serde_json::from_str(&quoted).map_err(|e| Error::Invalid(format!("invalid config string: {e}")))
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct PrivacyConfig {
+    local_only: bool,
+    store_transcripts: bool,
 }
-fn parse_bool(s: &str) -> Result<bool> {
-    match s {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(Error::Invalid(format!("expected boolean, got {s}"))),
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            local_only: true,
+            store_transcripts: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct SessionsConfig {
+    require_review: bool,
+    auto_create: bool,
+}
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            require_review: true,
+            auto_create: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct AgentsConfig {
+    #[serde(rename = "allow_writes")]
+    allow_writes: bool,
+    require_confirmation_for_decisions: bool,
+}
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            allow_writes: true,
+            require_confirmation_for_decisions: true,
+        }
     }
 }
 
@@ -121,6 +146,59 @@ mod tests {
         config.write(&path).unwrap();
         assert_eq!(JournalConfig::read(&path).unwrap(), config);
         fs::write(&path, "[project]\nname = \"\"\ndescription = \"\"\n").unwrap();
+        assert!(JournalConfig::read(&path).is_err());
+    }
+
+    #[test]
+    fn reads_standard_toml_syntax_comments_tables_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# Config produced by a TOML editor
+project.name = 'sample project'
+project.description = """A multiline
+project description."""
+
+[privacy]
+local_only = false # sync is managed elsewhere
+store_transcripts = true
+
+[sessions]
+require_review = false
+auto_create = true
+
+[agents]
+allow_writes = false
+require_confirmation_for_decisions = true
+future_setting = ["preserved by TOML parser", 7]
+"#,
+        )
+        .unwrap();
+
+        let config = JournalConfig::read(&path).unwrap();
+        assert_eq!(config.project.name, "sample project");
+        assert_eq!(
+            config.project.description,
+            "A multiline\nproject description."
+        );
+        assert!(!config.local_only);
+        assert!(config.store_transcripts);
+        assert!(!config.require_review);
+        assert!(!config.allow_agent_writes);
+    }
+
+    #[test]
+    fn rejects_invalid_toml_and_wrong_field_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[project\nname = 'broken'").unwrap();
+        assert!(JournalConfig::read(&path).is_err());
+        fs::write(
+            &path,
+            "[project]\nname = 'demo'\n[privacy]\nlocal_only = 'yes'",
+        )
+        .unwrap();
         assert!(JournalConfig::read(&path).is_err());
     }
 }

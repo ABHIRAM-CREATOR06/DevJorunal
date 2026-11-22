@@ -20,10 +20,27 @@ pub struct RecoveryReport {
     pub removed: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ProjectOverview {
+    pub project: crate::ProjectConfig,
+    pub total_entries: usize,
+    pub entries_by_category: std::collections::BTreeMap<String, usize>,
+    pub recent_decisions: Vec<Entry>,
+    pub open_tasks: Vec<Entry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SessionSummary {
+    pub session: Entry,
+    pub linked_entries: Vec<Entry>,
+    pub markdown: String,
+}
+
 impl Journal {
     pub fn init(project_dir: impl AsRef<Path>, config: JournalConfig) -> Result<Self> {
         let root = project_dir.as_ref().join(".devjournal");
         fs::create_dir_all(&root)?;
+        ensure_real_directory(&root)?;
         for dir in [
             "sessions",
             "decisions",
@@ -37,13 +54,17 @@ impl Journal {
             "relationships",
             "relationship-removals",
         ] {
-            fs::create_dir_all(root.join(dir))?;
+            let path = root.join(dir);
+            fs::create_dir_all(&path)?;
+            ensure_real_directory(&path)?;
         }
         let config_path = root.join("config.toml");
+        ensure_safe_file_target(&config_path)?;
         if !config_path.exists() {
             config.write(&config_path)?;
         }
         let ignore_path = root.join(".gitignore");
+        ensure_safe_file_target(&ignore_path)?;
         if !ignore_path.exists() {
             fs::write(ignore_path, "/index.sqlite3*\n")?;
         }
@@ -62,10 +83,12 @@ impl Journal {
             ),
         ] {
             let path = root.join(name);
+            ensure_safe_file_target(&path)?;
             if !path.exists() {
                 fs::write(path, body)?;
             }
         }
+        ensure_regular_file(&config_path)?;
         Ok(Self { root })
     }
 
@@ -74,6 +97,14 @@ impl Journal {
         if !root.is_dir() {
             return Err(Error::NotFound(".devjournal directory".into()));
         }
+        ensure_real_directory(&root)?;
+        for dir in entry_folders()
+            .into_iter()
+            .chain(["relationships", "relationship-removals"])
+        {
+            ensure_real_directory(&root.join(dir))?;
+        }
+        ensure_regular_file(&root.join("config.toml"))?;
         JournalConfig::read(&root.join("config.toml"))?;
         Ok(Self { root })
     }
@@ -140,9 +171,10 @@ impl Journal {
     pub fn get_relationship(&self, id: &str) -> Result<Relationship> {
         crate::relationship::validate_relationship_id(id)?;
         let path = self.root.join("relationships").join(format!("{id}.md"));
-        if !path.is_file() {
+        if !path.exists() {
             return Err(Error::NotFound(id.to_owned()));
         }
+        ensure_regular_file(&path)?;
         Relationship::from_markdown(&fs::read_to_string(path)?)
     }
 
@@ -188,6 +220,7 @@ impl Journal {
         for item in fs::read_dir(self.root.join("relationship-removals"))? {
             let path = item?.path();
             if path.extension().is_some_and(|extension| extension == "md") {
+                ensure_regular_file(&path)?;
                 let removal = RelationshipRemoval::from_markdown(&fs::read_to_string(&path)?)?;
                 let filename = path
                     .file_stem()
@@ -212,6 +245,7 @@ impl Journal {
         for item in fs::read_dir(self.root.join("relationships"))? {
             let path = item?.path();
             if path.extension().is_some_and(|extension| extension == "md") {
+                ensure_regular_file(&path)?;
                 let relation = Relationship::from_markdown(&fs::read_to_string(&path)?)?;
                 let filename = path
                     .file_stem()
@@ -284,6 +318,7 @@ impl Journal {
             for item in fs::read_dir(self.root.join(folder))? {
                 let path = item?.path();
                 if path.extension().is_some_and(|extension| extension == "md") {
+                    ensure_regular_file(&path)?;
                     let bytes = fs::read(&path)?;
                     let text = std::str::from_utf8(&bytes)
                         .map_err(|error| Error::Invalid(error.to_string()))?;
@@ -300,6 +335,10 @@ impl Journal {
 
     pub(crate) fn ensure_index_ignored(&self) -> Result<()> {
         let path = self.root.join(".gitignore");
+        ensure_safe_file_target(&path)?;
+        if path.exists() {
+            ensure_regular_file(&path)?;
+        }
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -364,11 +403,165 @@ impl Journal {
         validate_id(id)?;
         for folder in entry_folders() {
             let path = self.root.join(folder).join(format!("{id}.md"));
-            if path.is_file() {
+            if path.exists() {
+                ensure_regular_file(&path)?;
                 return Entry::from_markdown(&fs::read_to_string(path)?);
             }
         }
         Err(Error::NotFound(id.to_owned()))
+    }
+
+    pub fn entry_history(&self, id: &str) -> Result<Vec<Entry>> {
+        let selected = self.get_entry(id)?;
+        let entries = self.entries()?;
+        let metadata = entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), (entry.category, entry.title.as_str())))
+            .collect::<std::collections::HashMap<_, _>>();
+        let relationships = self.relationships()?;
+        let mut connected = std::collections::HashSet::from([id.to_owned()]);
+        loop {
+            let previous_size = connected.len();
+            for relation in relationships.iter().filter(|relation| {
+                let Some((source_category, source_title)) =
+                    metadata.get(relation.source_id.as_str())
+                else {
+                    return false;
+                };
+                let Some((target_category, target_title)) =
+                    metadata.get(relation.target_id.as_str())
+                else {
+                    return false;
+                };
+                *source_category == selected.category
+                    && *target_category == selected.category
+                    && (relation.kind == crate::RelationshipType::Supersedes
+                        || (relation.kind == crate::RelationshipType::References
+                            && source_title == target_title))
+            }) {
+                if connected.contains(&relation.source_id)
+                    || connected.contains(&relation.target_id)
+                {
+                    connected.insert(relation.source_id.clone());
+                    connected.insert(relation.target_id.clone());
+                }
+            }
+            if connected.len() == previous_size {
+                break;
+            }
+        }
+        let mut history = entries
+            .into_iter()
+            .filter(|entry| connected.contains(&entry.id))
+            .collect::<Vec<_>>();
+        history.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(history)
+    }
+
+    pub fn project_overview(&self) -> Result<ProjectOverview> {
+        let config = self.config()?;
+        let entries = self.entries()?;
+        let task_ids = entries
+            .iter()
+            .filter(|entry| entry.category == Category::Task)
+            .map(|entry| entry.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let superseded_tasks = self
+            .relationships()?
+            .into_iter()
+            .filter(|relation| {
+                relation.kind == crate::RelationshipType::Supersedes
+                    && task_ids.contains(relation.source_id.as_str())
+                    && task_ids.contains(relation.target_id.as_str())
+            })
+            .map(|relation| relation.target_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut entries_by_category = std::collections::BTreeMap::new();
+        for entry in &entries {
+            *entries_by_category
+                .entry(entry.category.as_str().to_owned())
+                .or_insert(0) += 1;
+        }
+        let mut recent_decisions = entries
+            .iter()
+            .filter(|entry| entry.category == Category::Decision)
+            .cloned()
+            .collect::<Vec<_>>();
+        recent_decisions.reverse();
+        recent_decisions.truncate(5);
+        let mut open_tasks = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.category == Category::Task
+                    && !superseded_tasks.contains(&entry.id)
+                    && !entry.status.as_deref().is_some_and(|status| {
+                        matches!(
+                            status.to_ascii_lowercase().as_str(),
+                            "done" | "complete" | "completed" | "closed" | "cancelled" | "canceled"
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        open_tasks.reverse();
+        open_tasks.truncate(20);
+        Ok(ProjectOverview {
+            project: config.project,
+            total_entries: entries_by_category.values().sum(),
+            entries_by_category,
+            recent_decisions,
+            open_tasks,
+        })
+    }
+
+    pub fn session_summary(&self, id: &str) -> Result<SessionSummary> {
+        let session = self.get_entry(id)?;
+        if session.category != Category::Session {
+            return Err(Error::Invalid(format!("{id} is not a session")));
+        }
+        let mut linked_ids = std::collections::HashSet::new();
+        for relation in self.relationships()? {
+            if relation.source_id == id && relation.target_id != id {
+                linked_ids.insert(relation.target_id);
+            } else if relation.target_id == id && relation.source_id != id {
+                linked_ids.insert(relation.source_id);
+            }
+        }
+        let mut linked_entries = linked_ids
+            .into_iter()
+            .map(|entry_id| self.get_entry(&entry_id))
+            .collect::<Result<Vec<_>>>()?;
+        linked_entries.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut markdown = format!(
+            "# Session summary: {}\n\nGenerated deterministically from the saved session and linked records.\n\n## Session record\n\n{}\n",
+            session.title, session.content
+        );
+        if linked_entries.is_empty() {
+            markdown.push_str("\n## Linked records\n\nNo linked records.\n");
+        } else {
+            markdown.push_str("\n## Linked records\n");
+            for entry in &linked_entries {
+                markdown.push_str(&format!(
+                    "\n### {} ({})\n\n{}\n",
+                    entry.title,
+                    entry.category.as_str(),
+                    entry.content
+                ));
+            }
+        }
+        Ok(SessionSummary {
+            session,
+            linked_entries,
+            markdown,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -382,6 +575,7 @@ impl Journal {
             for item in fs::read_dir(dir)? {
                 let path = item?.path();
                 if path.extension().is_some_and(|extension| extension == "md") {
+                    ensure_regular_file(&path)?;
                     entries.push(Entry::from_markdown(&fs::read_to_string(path)?)?);
                 }
             }
@@ -434,6 +628,42 @@ fn validate_id(id: &str) -> Result<()> {
         return Err(Error::Invalid("unsafe entry id".into()));
     }
     Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Invalid(format!(
+            "journal directory must not be a symlink: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_regular_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::Invalid(format!(
+            "journal file must be a regular file, not a symlink: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_safe_file_target(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(Error::Invalid(format!(
+                "journal file target must be a regular file: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn entry_folders() -> [&'static str; 8] {

@@ -4,12 +4,14 @@ use std::{
     process::ExitCode,
 };
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use devjournal_core::{
     Author, AuthorType, Category, ContextItem, ContextReason, Entry, EntrySource, EntrySourceType,
-    Error, Journal, JournalConfig, KnowledgeGraph, Relationship, RelationshipType, SearchIndex,
-    retrieve_context,
+    Error, Journal, JournalConfig, KnowledgeGraph, Relationship, RelationshipType, SearchFilters,
+    SearchIndex, retrieve_context,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -36,6 +38,7 @@ enum Command {
         description: String,
     },
     Status,
+    Overview,
     Note {
         #[command(subcommand)]
         command: Option<NewCommand>,
@@ -58,6 +61,16 @@ enum Command {
         category: Option<CategoryArg>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, value_name = "RFC3339")]
+        created_after: Option<String>,
+        #[arg(long, value_name = "RFC3339")]
+        created_before: Option<String>,
     },
     Context {
         topic: Option<String>,
@@ -149,7 +162,23 @@ enum IndexCommand {
 
 #[derive(Subcommand)]
 enum EntryCommand {
-    Show { id: String },
+    Show {
+        id: String,
+    },
+    History {
+        id: String,
+    },
+    Revise {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+        #[arg(long, default_value = "human")]
+        author: String,
+    },
 }
 #[derive(Subcommand)]
 enum NewCommand {
@@ -173,6 +202,9 @@ enum SessionCommand {
         author: String,
     },
     List,
+    Summary {
+        id: String,
+    },
 }
 #[derive(Subcommand)]
 enum TaskCommand {
@@ -330,6 +362,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ),
             );
         }
+        Command::Overview => {
+            let overview = Journal::open(&project)?.project_overview()?;
+            let markdown = format!(
+                "# {}\n\n{}\n\n{} entries across {} categories.\n",
+                overview.project.name,
+                overview.project.description,
+                overview.total_entries,
+                overview.entries_by_category.len()
+            );
+            emit(
+                as_json,
+                json!({"overview":overview,"markdown":markdown}),
+                markdown,
+            );
+        }
         Command::Note { command } => {
             create_interactive(&project, Category::Note, command, as_json)?
         }
@@ -358,6 +405,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Session {
             command: SessionCommand::List,
         } => list(&project, Category::Session, as_json)?,
+        Command::Session {
+            command: SessionCommand::Summary { id },
+        } => {
+            let summary = Journal::open(&project)?.session_summary(&id)?;
+            emit(as_json, json!(summary), summary.markdown.clone());
+        }
         Command::Task {
             command: TaskCommand::List,
         } => list(&project, Category::Task, as_json)?,
@@ -370,19 +423,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if old.category != Category::Task {
                 return Err(Box::new(Error::Invalid(format!("{id} is not a task"))));
             }
-            let mut update = Entry::new(
-                old.title,
-                Category::Task,
-                old.content,
-                author_record(&author),
-            );
-            update.source = source_for(&author);
-            update.related.push(id);
-            update.status = Some(status);
-            let path = journal.create_entry(&update)?;
+            let (update, path, relationship) = create_revision(
+                &journal,
+                &old,
+                old.title.clone(),
+                old.content.clone(),
+                None,
+                Some(status),
+                &author,
+            )?;
             emit(
                 as_json,
-                json!({"path": path, "entry": update}),
+                json!({"path": path, "entry": update, "supersedes": relationship}),
                 format!("Created task revision {}", path.display()),
             );
         }
@@ -390,12 +442,32 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             query,
             category,
             limit,
+            author,
+            tag,
+            status,
+            created_after,
+            created_before,
         } => {
             let journal = Journal::open(&project)?;
             let mut index = SearchIndex::open(&journal)?;
             index.sync(&journal)?;
+            let filters = SearchFilters {
+                category: category.map(Into::into),
+                author,
+                tag,
+                status,
+                created_after: parse_rfc3339(created_after.as_deref())?,
+                created_before: parse_rfc3339(created_before.as_deref())?,
+            };
+            if let (Some(start), Some(end)) = (&filters.created_after, &filters.created_before)
+                && start > end
+            {
+                return Err(Box::new(Error::Invalid(
+                    "--created-after must not be later than --created-before".into(),
+                )));
+            }
             let entries = index
-                .search_ids(&query, category.map(Into::into), limit.min(100))?
+                .search_ids_filtered(&query, &filters, limit.min(100))?
                 .iter()
                 .map(|id| journal.get_entry(id))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -598,6 +670,60 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Entry {
+            command:
+                EntryCommand::Revise {
+                    id,
+                    title,
+                    content,
+                    tags,
+                    author,
+                },
+        } => {
+            let journal = Journal::open(&project)?;
+            let previous = journal.get_entry(&id)?;
+            if title.is_none() && content.is_none() && tags.is_none() {
+                return Err(Box::new(Error::Invalid(
+                    "provide at least one of --title, --content, or --tags".into(),
+                )));
+            }
+            let (entry, path, relationship) = create_revision(
+                &journal,
+                &previous,
+                title.unwrap_or_else(|| previous.title.clone()),
+                content.unwrap_or_else(|| previous.content.clone()),
+                tags,
+                previous.status.clone(),
+                &author,
+            )?;
+            emit(
+                as_json,
+                json!({"path":path,"entry":entry,"supersedes":relationship}),
+                format!("Created revision {}", path.display()),
+            );
+        }
+        Command::Entry {
+            command: EntryCommand::History { id },
+        } => {
+            let history = Journal::open(&project)?.entry_history(&id)?;
+            let human = history
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}\t{}\t{}",
+                        entry.id,
+                        entry.status.as_deref().unwrap_or(""),
+                        entry.title
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            emit(
+                as_json,
+                json!({"entry_id": id, "revisions": history}),
+                human,
+            );
+        }
+        Command::Entry {
             command: EntryCommand::Show { id },
         }
         | Command::LegacyShow { id } => {
@@ -678,6 +804,20 @@ fn create_interactive(
     Ok(())
 }
 
+fn parse_rfc3339(value: Option<&str>) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|error| {
+                    Box::new(Error::Invalid(format!(
+                        "invalid RFC3339 timestamp {value}: {error}"
+                    ))) as Box<dyn std::error::Error>
+                })
+        })
+        .transpose()
+}
+
 fn required_single(
     value: Option<String>,
     label: &str,
@@ -752,13 +892,74 @@ fn list(
     category: Category,
     as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let entries: Vec<_> = Journal::open(project)?
+    let journal = Journal::open(project)?;
+    let entries: Vec<_> = journal
         .entries()?
         .into_iter()
         .filter(|entry| entry.category == category)
         .collect();
-    emit(as_json, json!(entries), format_entries(&entries));
+    if category == Category::Task {
+        let mut seen = std::collections::HashSet::new();
+        let mut groups = Vec::new();
+        for entry in &entries {
+            if seen.contains(&entry.id) {
+                continue;
+            }
+            let history = journal.entry_history(&entry.id)?;
+            seen.extend(history.iter().map(|revision| revision.id.clone()));
+            let current = history.last().cloned().unwrap_or_else(|| entry.clone());
+            groups.push(TaskRevisionGroup { current, history });
+        }
+        groups.sort_by_key(|group| std::cmp::Reverse(group.current.created_at));
+        let human = groups
+            .iter()
+            .map(|group| {
+                format!(
+                    "{}\t{}\t{}\t{} revision(s)",
+                    group.current.id,
+                    group.current.status.as_deref().unwrap_or(""),
+                    group.current.title,
+                    group.history.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        emit(as_json, json!(groups), human);
+    } else {
+        emit(as_json, json!(entries), format_entries(&entries));
+    }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct TaskRevisionGroup {
+    current: Entry,
+    history: Vec<Entry>,
+}
+
+fn create_revision(
+    journal: &Journal,
+    previous: &Entry,
+    title: String,
+    content: String,
+    tags: Option<Vec<String>>,
+    status: Option<String>,
+    author: &str,
+) -> Result<(Entry, PathBuf, Relationship), Box<dyn std::error::Error>> {
+    let mut revision = Entry::new(title, previous.category, content, author_record(author));
+    revision.source = source_for(author);
+    revision.tags = tags.unwrap_or_else(|| previous.tags.clone());
+    revision.status = status;
+    let path = journal.create_entry(&revision)?;
+    let relationship = Relationship::new(
+        revision.id.clone(),
+        previous.id.clone(),
+        RelationshipType::Supersedes,
+        author_record(author),
+        source_for(author),
+    );
+    journal.create_relationship(&relationship)?;
+    Ok((revision, path, relationship))
 }
 
 fn indexed_graph(journal: &Journal) -> Result<KnowledgeGraph, Box<dyn std::error::Error>> {

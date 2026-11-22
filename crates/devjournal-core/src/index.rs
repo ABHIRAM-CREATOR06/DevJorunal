@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Transaction, params};
 use serde::Serialize;
 use uuid::Uuid;
@@ -37,10 +38,27 @@ pub struct IndexVerification {
     pub fts_ok: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SearchFilters {
+    pub category: Option<Category>,
+    pub author: Option<String>,
+    pub tag: Option<String>,
+    pub status: Option<String>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
+}
+
 impl SearchIndex {
     pub fn open(journal: &Journal) -> Result<Self> {
         journal.ensure_index_ignored()?;
         let path = journal.index_path();
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(Error::Invalid(
+                "the journal index path must be a regular file, not a symlink".into(),
+            ));
+        }
         let connection = Connection::open(&path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
@@ -153,21 +171,79 @@ impl SearchIndex {
         category: Option<Category>,
         limit: usize,
     ) -> Result<Vec<String>> {
+        self.search_ids_filtered(
+            query,
+            &SearchFilters {
+                category,
+                ..SearchFilters::default()
+            },
+            limit,
+        )
+    }
+
+    pub fn search_ids_filtered(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        if query.len() > 512 || limit > 100 {
+            return Err(Error::Invalid(
+                "search query cannot exceed 512 bytes and result limit cannot exceed 100".into(),
+            ));
+        }
+        if [
+            filters.author.as_deref(),
+            filters.tag.as_deref(),
+            filters.status.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.len() > 256)
+        {
+            return Err(Error::Invalid(
+                "search metadata filter values cannot exceed 256 bytes".into(),
+            ));
+        }
         let expression = fts_expression(query);
-        let category = category.map(|value| value.as_str().to_owned());
+        let category = filters.category.map(|value| value.as_str().to_owned());
+        let tag = filters
+            .tag
+            .as_deref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| Error::Index(error.to_string()))?;
+        let created_after = filters.created_after.map(|value| value.to_rfc3339());
+        let created_before = filters.created_before.map(|value| value.to_rfc3339());
         let mut statement = self.connection.prepare(
             "SELECT entries.id FROM entry_fts
              JOIN entries ON entries.id = entry_fts.entry_id
-             WHERE entry_fts MATCH ?1 AND (?2 IS NULL OR entries.category = ?2)
-             ORDER BY bm25(entry_fts), entries.created_at DESC LIMIT ?3",
+             WHERE entry_fts MATCH ?1
+               AND (?2 IS NULL OR entries.category = ?2)
+               AND (?3 IS NULL OR entries.author_name = ?3)
+               AND (?4 IS NULL OR instr(entries.tags, ?4) > 0)
+               AND (?5 IS NULL OR entries.status = ?5)
+               AND (?6 IS NULL OR entries.created_at >= ?6)
+               AND (?7 IS NULL OR entries.created_at <= ?7)
+             ORDER BY bm25(entry_fts), entries.created_at DESC LIMIT ?8",
         )?;
         let ids = statement
-            .query_map(params![expression, category, limit as i64], |row| {
-                row.get(0)
-            })?
+            .query_map(
+                params![
+                    expression,
+                    category,
+                    filters.author,
+                    tag,
+                    filters.status,
+                    created_after,
+                    created_before,
+                    limit as i64
+                ],
+                |row| row.get(0),
+            )?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(ids)
     }

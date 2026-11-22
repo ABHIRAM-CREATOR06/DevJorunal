@@ -1,23 +1,25 @@
 # Development progress
 
-## Phase 1 — Core foundation (complete)
+## Foundation, configuration, and revisions
 
-Implemented the Rust workspace, core entry model, category and provenance types, validation, `.devjournal` initialization, default project configuration, and create-only Markdown storage with retrieval by ID. New records are stored in category folders where defined and under `entries/` for other categories. Existing records and project files are preserved during initialization.
+The Rust workspace stores portable Markdown entries under `.devjournal/`. Configuration uses serde-backed TOML parsing with validation of syntax, known field types, and the required project name. `entry revise` and `entry history` preserve prior records; new revisions link to the earlier record with a `supersedes` edge.
 
-Tests cover initialization and entry round-trip, config round-trip/validation, plus path traversal and overwrite refusal. The earlier create-only implementation used direct writes; the reliability behavior is now described below.
+## CLI and storage reliability
 
-## Phase 2 — CLI (complete)
+The CLI supports JSON output, terminal-only prompts, task updates, and grouped task revision history. Entry writes stage a unique file in the destination directory, sync and validate it, then publish without replacing an existing ID. `recover` lists known stale temporary files and `recover --clean` removes them explicitly.
 
-Implemented `init`, `status`, `note new`, `decision new`, `session start/list`, `task list/update`, `search`, `context`, and `entry show` (`show` remains an alias). Search scans Markdown directly. Task updates append a related follow-up record to preserve history. JSON is available with `--json`; errors use JSON on stderr, and results use JSON on stdout. Missing note/decision fields are prompted only in a terminal and never in JSON mode.
+## Knowledge graph, indexing, and context
 
-## Storage reliability milestone (complete)
+Typed relationships persist as Markdown, with removal tombstones. The graph engine supports traversal, paths, cycle detection, and relationship queries. Bundled SQLite FTS5 is a disposable search/index layer; filters include category, exact author, exact tag, status, and creation-time range. Context retrieval combines direct text results and linked records with deterministic reasons.
 
-Entry writes stage a uniquely named file in the final directory, flush and sync it, validate a read-back parse, and publish without replacing existing IDs. Windows uses same-volume `MoveFileW`; Unix uses atomic no-clobber hard-link publication and syncs the parent directory. Failed operations clean the temp. `recover` lists matching stale temps and `recover --clean` removes them explicitly without promotion. Tests cover injected validation failure, preservation, cleanup, duplicate IDs, and concurrent creation.
+## MCP, Zed, and continuity
 
-## Phase 3 — Knowledge graph, indexing & context (complete)
+`devjournal-mcp` is a local stdio server built with the official Rust MCP SDK. Its tools search and read project knowledge, and its resources expose the overview, entries, and session summaries. `overview` and `session summary` create deterministic views from saved records. Zed connects through its custom local MCP server setting; the current Zed docs describe MCP server extensions as deprecated.
 
-Added typed, provenance-bearing Markdown relationships with tombstones for unlinking, a directed graph API with symmetric `relates_to` edges, SQLite FTS5 indexing, incremental updates, verification and rebuild recovery. Search and context use the disposable index; context can include explained graph neighbors. Added `link`, `unlink`, `relationships`, `graph`, and `index` CLI commands with JSON output. Markdown remains the source of truth, and the generated SQLite database is ignored by Git. The workspace MSRV is Rust 1.89 to support the bundled SQLite dependency.
+## Release preparation
+
+`CONTRIBUTING.md` documents offline build/test/lint commands. `examples/README.md` shows common revision, search, overview, and Zed setup workflows. Cargo install commands are documented in `README.md`. Source review added guards against symlinked journal directories and files and confirmed MCP tools are read-only for Markdown. This was a focused source review, not a full independent penetration test or race-condition audit.
 
 ## Verification
 
-`cargo test --workspace --offline` passed (30 tests); `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed. Integration coverage exercises relationships, graph queries, index recovery, context explanations, and JSON CLI workflows end to end. The workspace is on OneDrive, so Cargo may report incremental-cache hard-link fallback warnings; these do not affect the build or tests. MCP and Zed remain future phases.
+`cargo test --workspace --offline` passes (41 tests); `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` pass. The MCP integration test starts the stdio server and exercises its JSON-RPC handshake, tools, and resources. Cargo may report incremental-cache hard-link fallback warnings on OneDrive; they do not affect build/test results.

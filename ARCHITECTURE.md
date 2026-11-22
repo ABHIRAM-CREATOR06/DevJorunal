@@ -10,7 +10,7 @@ Entry writes stage a unique file in the destination directory, flush and sync it
 
 ## Planned boundaries
 
-- CLI and MCP will call the core library and remain separate binaries.
+- CLI and MCP call the core library and remain separate binaries.
 - Markdown stays authoritative; SQLite FTS will be derived and rebuildable.
 - Editor integrations are optional clients of the CLI/MCP surface.
 - No network client or AI provider belongs in the core.
@@ -29,6 +29,18 @@ Rusqlite with bundled SQLite provides `.devjournal/index.sqlite3`; FTS5 indexes 
 
 Context retrieval ranks direct FTS matches first, then adds unique graph neighbors breadth-first up to the requested depth/limit. Each item includes a deterministic reason (`direct_text_match`, `requested_entry`, `recent_project_activity`, or the edge type and parent entry ID). The full entry is retrieved from Markdown, retaining authorship and provenance. No embeddings or model calls are involved.
 
+Search filters can restrict results by category, exact author, exact tag, status, and RFC3339 creation-time bounds. Task updates and manual entry revisions create new Markdown entries and a `supersedes` edge; task listing groups each history and shows the newest revision. `entry history` returns the complete same-category revision chain.
+
+## Project continuity
+
+`project_overview` derives category counts, recent decisions, and current open tasks from saved entries. `session_summary` combines a saved session with its linked records into deterministic Markdown. These are generated views and do not rewrite source records or call a model.
+
+## MCP and Zed
+
+The separate `devjournal-mcp` binary uses the official Rust MCP SDK over stdio. It exposes read tools for search, entries, graph context, project overview, and session summaries. It also exposes a project overview resource plus URI templates for entries and session summaries. MCP reads may synchronize the disposable SQLite index; they never edit Markdown records.
+
+Zed can launch the binary as a custom local MCP server. Zed currently supports MCP tools and prompts, so it can use the tools; resource URIs are available to MCP clients that implement resources. Zed's MCP server extension path is being deprecated in favor of the MCP registry, so DevJournal documents the custom-server path and does not ship a Zed extension.
+
 ## Security
 
-Entry and relationship IDs are constrained before they are joined to storage paths. Entries and relationships are treated as data and never executed. Atomic create-only writes preserve existing files. Config parsing validates supported values and required project name. The current parser handles the documented config subset; broad TOML compatibility and concurrent update/locking semantics remain future work.
+Entry and relationship IDs are constrained before they are joined to storage paths. Journal directories and Markdown/config/index files are checked to reject symlinks and non-regular files before reading or opening them. Entries and relationships are treated as data and never executed. Atomic create-only writes preserve existing files. TOML parsing validates syntax, field types, and the required project name. MCP is stdio-only and provides read tools; writes remain available through the CLI and Markdown workflow.
