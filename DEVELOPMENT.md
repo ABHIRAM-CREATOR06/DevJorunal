@@ -20,4 +20,4 @@ Added typed, provenance-bearing Markdown relationships with tombstones for unlin
 
 ## Verification
 
-`cargo test --workspace --offline` passed (26 tests); `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed. CLI integration coverage exercises JSON relationship, graph, index, and context commands end to end. The workspace is on OneDrive, so Cargo may report incremental-cache hard-link fallback warnings; these do not affect the build or tests. MCP and Zed remain future phases.
+`cargo test --workspace --offline` passed (30 tests); `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed. Integration coverage exercises relationships, graph queries, index recovery, context explanations, and JSON CLI workflows end to end. The workspace is on OneDrive, so Cargo may report incremental-cache hard-link fallback warnings; these do not affect the build or tests. MCP and Zed remain future phases.
