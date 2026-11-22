@@ -1,25 +1,81 @@
 # DevJournal
 
-DevJournal is a local-first, project-owned journal for development knowledge. It provides a Rust library, CLI, and optional stdio MCP server for portable Markdown records, graph relationships, indexed search, and project context.
+### Your project's memory, in files you own.
 
-## Current status
+DevJournal keeps the decisions, tasks, discoveries, and session notes behind a codebase close to the code itself. Write portable Markdown, connect related entries, and find the context again from the CLI, Rust library, or an MCP-compatible assistant.
 
-The roadmap phases are implemented. The workspace includes standard TOML config parsing, append-only entry revisions, typed Markdown relationships, graph traversal, rebuildable SQLite FTS5 indexing, metadata-filtered search, graph-aware context, deterministic project/session summaries, a JSON CLI, and a local MCP server. See [ROADMAP.md](ROADMAP.md) for scope and remaining future work.
-
-## Workspace
+**Local-first · Markdown-backed · Searchable · Built with Rust**
 
 ```text
-crates/devjournal-core/  Core models, configuration, Markdown storage
-crates/devjournal-cli/   Command-line interface
-crates/devjournal-mcp/   Local stdio MCP server
-ARCHITECTURE.md          Architecture and trust boundaries
-ROADMAP.md               Phases and acceptance criteria
-docs/storage.md          On-disk format
-docs/mcp.md              MCP setup and Zed configuration
-CONTRIBUTING.md          Build, test, and contribution workflow
+Your project
+└── .devjournal/
+    ├── config.toml          project settings
+    ├── decisions/           why the code is this way
+    ├── notes/               discoveries and working knowledge
+    ├── tasks/               work, status, and revision history
+    ├── sessions/            what happened in a work session
+    ├── relationships/       links between entries
+    └── index.sqlite3        rebuildable search index
 ```
 
-## Library example
+## Get started
+
+From the repository checkout:
+
+```powershell
+cargo run -p devjournal -- init --name my-project
+cargo run -p devjournal -- note new "Build setup" --content "The workspace uses Rust."
+cargo run -p devjournal -- search Rust
+cargo run -p devjournal -- overview
+```
+
+Use `--project PATH` to select a project directory. Add `--json` to supported commands for machine-readable output.
+
+## A small, connected knowledge base
+
+| Keep | Find and connect |
+| --- | --- |
+| Decisions, notes, tasks, and sessions as Markdown | Full-text search with category, author, tag, status, and date filters |
+| Append-only revisions, so earlier thinking stays available | Relationships, graph traversal, and graph-aware context retrieval |
+| Project overview and deterministic session summaries | JSON output for scripts and other tools |
+
+The SQLite index is a disposable local cache. Rebuild it from the Markdown journal whenever needed; the records stay readable without DevJournal.
+
+## Follow a decision from question to context
+
+```powershell
+# Capture the decision
+cargo run -p devjournal -- decision new "Use SQLite for local search" --content "Markdown stays canonical; the index is rebuildable."
+
+# Link related work, then find the thread later
+cargo run -p devjournal -- link dj-task-id dj-decision-id --type implements
+cargo run -p devjournal -- search SQLite --tag storage --json
+cargo run -p devjournal -- context --topic "local search" --depth 2
+```
+
+Entry IDs are printed when records are created. Use those IDs in later commands. `cargo run -p devjournal -- --help` and `cargo run -p devjournal -- <command> --help` show the available options.
+
+## Revise without erasing history
+
+```powershell
+cargo run -p devjournal -- entry revise dj-entry-id --content "Updated decision after measuring the workload."
+cargo run -p devjournal -- entry history dj-entry-id
+```
+
+Revisions create a new entry connected with `supersedes`. Earlier text remains intact, and task lists group revisions under the current task.
+
+## Connect an MCP client
+
+The optional `devjournal-mcp` server runs locally over stdio. Its tools provide search, entry lookup, graph context, project overviews, and session summaries. It also exposes MCP resources for clients that support them.
+
+```powershell
+cargo install --locked --path crates/devjournal-cli
+cargo install --locked --path crates/devjournal-mcp
+```
+
+Then configure your MCP client to launch `devjournal-mcp --project <absolute-project-path>`. See [MCP and Zed setup](docs/mcp.md) for configuration details and current Zed support.
+
+## Rust library
 
 ```rust
 use devjournal_core::{Author, AuthorType, Category, Entry, Journal, JournalConfig};
@@ -32,47 +88,28 @@ let entry = Entry::new(
     Author { kind: AuthorType::Human, name: "developer".into() },
 );
 journal.create_entry(&entry)?;
-let saved = journal.get_entry(&entry.id)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-## CLI quick start
+## Design principles
+
+- **Your records are yours.** Markdown is the source of truth; no hosted service or account is required.
+- **History is additive.** Revisions preserve previous entries instead of silently replacing them.
+- **Context has structure.** Typed relationships connect decisions, tasks, notes, and sessions.
+- **Automation stays inspectable.** JSON and MCP make the same project knowledge available to tools.
+
+Transcript storage is disabled by default. MCP is stdio-only and reads the configured project's journal; index synchronization may update the generated cache and its Git ignore rule.
+
+## Build and contribute
 
 ```powershell
-cargo run -p devjournal -- init --name my-project
-cargo run -p devjournal -- note new "Build setup" --content "The workspace uses Rust."
-cargo run -p devjournal -- search Rust
-cargo run -p devjournal -- status
+cargo test --workspace --offline
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --offline -- -D warnings
 ```
 
-Commands include `init`, `status`, `overview`, `note new`, `decision new`, `session start/list/summary`, `task list/update`, `search`, `context`, `entry show/revise/history`, `link`, `unlink`, `relationships list`, `graph`, `index`, and `recover`. Revisions create new entries with `supersedes` relationships; earlier content remains intact. Use `--project PATH` to select a project directory.
-
-```powershell
-cargo run -p devjournal -- link dj-source dj-target --type implements
-cargo run -p devjournal -- relationships list dj-source
-cargo run -p devjournal -- graph neighbors dj-source --depth 2 --json
-cargo run -p devjournal -- context --topic authentication --depth 2 --json
-cargo run -p devjournal -- index rebuild
-cargo run -p devjournal -- index verify --json
-cargo run -p devjournal -- search auth --author Ada --tag security --status open --created-after 2026-01-01T00:00:00Z --json
-cargo run -p devjournal -- entry revise dj-entry-id --content "Reviewed replacement text"
-cargo run -p devjournal -- entry history dj-entry-id --json
-cargo run -p devjournal -- overview --json
-cargo run -p devjournal -- session summary dj-session-id
-```
-
-Add `--json` to data commands for machine-readable output, for example `status --json`, `search Rust --json`, `entry show <id> --json`, `context --json`, and `session list --json`. JSON results go to stdout; JSON errors go to stderr with an `error.code` and `error.message`. Empty list/search results are JSON arrays. `context --json` without a topic returns up to ten most recent entries.
-
-In a terminal, omit the note/decision title or content to be prompted. Multiline content ends with a line containing `.`; enter `:cancel` to abort. Prompts are disabled for piped input and JSON mode. Run `devjournal recover` to list recognized leftover write temps, or `devjournal recover --clean` to delete those temp files explicitly.
-
-See [MCP and Zed setup](docs/mcp.md) to build and connect the optional local server. Install both commands from a checkout with `cargo install --locked --path crates/devjournal-cli` and `cargo install --locked --path crates/devjournal-mcp`.
-
-Run checks with `cargo test --workspace --offline`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --all-targets --offline -- -D warnings`.
-
-## Data and privacy
-
-Knowledge is stored as Markdown under `.devjournal/`; configuration defaults to local-only and transcript storage is disabled. SQLite is a disposable local index and is ignored by Git. MCP uses stdio and reads only the configured project's journal. See [storage format](docs/storage.md), [architecture](ARCHITECTURE.md), and [MCP security notes](docs/mcp.md#security-and-access).
+The workspace contains the core library, CLI, and MCP server. Start with [contributing](CONTRIBUTING.md), [architecture](ARCHITECTURE.md), [storage format](docs/storage.md), or the [roadmap](ROADMAP.md). Working examples are collected in [examples](examples/README.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE)
